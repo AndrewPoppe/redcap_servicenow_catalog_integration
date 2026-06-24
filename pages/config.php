@@ -19,6 +19,9 @@ $savedUrl      = (string) ($module->getProjectSetting('servicenow-instance-url')
 $savedUsername = (string) ($module->getProjectSetting('servicenow-username') ?? '');
 $hasPassword   = !empty($module->getProjectSetting('servicenow-password'));
 $savedSysId    = (string) ($module->getProjectSetting('servicenow-catalog-sys-id') ?? '');
+if (empty($savedSysId) && !empty($snapshot['sys_id'])) {
+    $savedSysId = (string) $snapshot['sys_id'];
+}
 $fieldMappings = $module->getProjectSetting('field-mappings');
 if (is_string($fieldMappings)) {
     // Handle legacy saves where mappings were stored as a JSON string
@@ -42,7 +45,10 @@ foreach ($metaData as $fieldInfo) {
     ];
 }
 
-$autoLoad = ($savedUrl && $savedUsername && $hasPassword && $savedSysId) ? 'true' : 'false';
+$snapshot = $module->getProjectSetting('catalog-item-snapshot');
+if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot['variables'])) {
+    $snapshot = null;
+}
 ?>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
 <style>
@@ -245,7 +251,7 @@ $(document).ready(function () {
     const SAVED_MAP    = <?= json_encode($fieldMappings) ?>;
     const RC_FIELDS    = <?= json_encode($redcapFields) ?>;
     let HAS_PASSWORD = <?= $hasPassword ? 'true' : 'false' ?>;
-    const AUTO_LOAD    = <?= $autoLoad ?>;
+    const SNAPSHOT     = <?= json_encode($snapshot) ?>;
 
     // ServiceNow catalog variable type codes → labels
     const SN_VAR_TYPES = {
@@ -588,9 +594,9 @@ $(document).ready(function () {
         $('#pw-eye-icon').toggleClass('fa-eye fa-eye-slash');
     });
 
-    // ── Auto-load fields when the page opens with a full configuration ────
-    if (AUTO_LOAD) {
-        fetchFields();
+    // ── Populate mapping table from snapshot on page load ─────────────────
+    if (SNAPSHOT && Array.isArray(SNAPSHOT.variables) && SNAPSHOT.variables.length > 0) {
+        renderMappingTable(SNAPSHOT.variables);
     }
 });
 </script>

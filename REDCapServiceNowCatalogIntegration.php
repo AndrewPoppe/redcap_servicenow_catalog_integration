@@ -164,10 +164,26 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         curl_close($ch);
 
         if ($httpCode === 200) {
-            return ['success' => true, 'data' => json_decode($response, true)];
+            $data      = json_decode($response, true);
+            $variables = $data['result'] ?? [];
+            $this->saveSnapshot($catalogItemId, $variables);
+            return ['success' => true, 'data' => $data];
         } else {
             return ['success' => false, 'error' => 'Failed to fetch fields. HTTP Code: ' . $httpCode, 'responseJSON' => $response];
         }
     }
 
+    /**
+     * Persists the ServiceNow catalog item variables so the configuration
+     * page can populate the mapping table on subsequent loads without an
+     * additional API call.
+     */
+    private function saveSnapshot(string $catalogItemId, array $variables): void
+    {
+        $this->framework->setProjectSetting('catalog-item-snapshot', [
+            'sys_id'     => $catalogItemId,
+            'variables'  => $variables,
+            'fetched_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
 }
