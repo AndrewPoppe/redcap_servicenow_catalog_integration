@@ -20,6 +20,10 @@ $savedUsername = (string) ($module->getProjectSetting('servicenow-username') ?? 
 $hasPassword   = !empty($module->getProjectSetting('servicenow-password'));
 $savedSysId    = (string) ($module->getProjectSetting('servicenow-catalog-sys-id') ?? '');
 $fieldMappings = $module->getProjectSetting('field-mappings');
+if (is_string($fieldMappings)) {
+    // Handle legacy saves where mappings were stored as a JSON string
+    $fieldMappings = json_decode($fieldMappings, true) ?? [];
+}
 if (!is_array($fieldMappings)) {
     $fieldMappings = [];
 }
@@ -379,12 +383,20 @@ $(document).ready(function () {
         $('#btn-save').prop('disabled', false);
         $('#btn-reload').show();
 
-        // Initialise Select2 on all dropdowns
+        // Initialise Select2 on all dropdowns, then restore saved mappings.
+        // Select2 does not reliably read the HTML `selected` attribute when
+        // allowClear/placeholder are active, so we set the value explicitly.
         $('#mapping-tbody .rc-field-select').select2({
             width:          '100%',
             placeholder:    '\u2014 Do not map \u2014',
             allowClear:     true,
             dropdownParent: $('#sn-config-page')
+        });
+
+        $('#mapping-tbody tr[data-sn-field]').each(function () {
+            const snField    = $(this).data('sn-field');
+            const savedValue = SAVED_MAP[snField] || null;
+            $(this).find('.rc-field-select').val(savedValue).trigger('change');
         });
     }
 

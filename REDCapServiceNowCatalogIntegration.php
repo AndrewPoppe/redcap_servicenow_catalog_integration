@@ -42,9 +42,9 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         if (empty($instanceUrl) || empty($username) || empty($password)) {
             return ['success' => false, 'message' => 'Missing required parameters.'];
         }
-        $this->framework->setSystemSetting('servicenow-instance-url', $instanceUrl);
-        $this->framework->setSystemSetting('servicenow-username', $username);
-        $this->framework->setSystemSetting('servicenow-password', $password);
+        $this->framework->setProjectSetting('servicenow-instance-url', $instanceUrl);
+        $this->framework->setProjectSetting('servicenow-username', $username);
+        $this->framework->setProjectSetting('servicenow-password', $password);
         return ['success' => true, 'message' => 'Connection settings saved successfully.'];
     }
 
@@ -60,8 +60,8 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             return ['success' => false, 'message' => 'Missing or invalid required parameter: fieldMappings.'];
         }
 
-        $this->framework->setProjectSetting('catalog-sys-id', $sysId);
-        $this->framework->setProjectSetting('field-mappings', json_encode($fieldMappings));
+        $this->framework->setProjectSetting('servicenow-catalog-sys-id', $sysId);
+        $this->framework->setProjectSetting('field-mappings', $fieldMappings);
         return ['success' => true, 'message' => 'Configuration saved successfully.'];
     }
 
@@ -75,7 +75,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             return ['success' => false, 'message' => 'Missing required parameters.'];
         }
 
-        // If the provided password is a placeholder, retrieve the actual password from system settings
+        // If the provided password is a placeholder, retrieve the actual password from project settings
         if ($password === '__SAVED__') {
             $password = $this->framework->getProjectSetting('servicenow-password');
             $this->framework->log("Using saved password for ServiceNow connection test: $password");
@@ -124,9 +124,9 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 
     private function getServiceNowConnectionSettings()
     {
-        $instanceUrl = $this->framework->getSystemSetting('servicenow-instance-url');
-        $username = $this->framework->getSystemSetting('servicenow-username');
-        $password = $this->framework->getSystemSetting('servicenow-password');
+        $instanceUrl = $this->framework->getProjectSetting('servicenow-instance-url');
+        $username = $this->framework->getProjectSetting('servicenow-username');
+        $password = $this->framework->getProjectSetting('servicenow-password');
 
         return [
             'instanceUrl' => $instanceUrl,
