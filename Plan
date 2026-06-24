@@ -1,0 +1,19 @@
+This will be a REDCap External Module (https://github.com/vanderbilt-redcap/external-module-framework-docs) that
+integrates with a ServiceNow catalog to allow users to submit requests directly from REDCap. The module will provide a 
+user-friendly interface within REDCap, allowing users to specify the sys_id of the ServiceNow catalog item they wish to 
+support and then configure the necessary fields for submission. The module will handle the communication with the 
+ServiceNow API (https://www.servicenow.com/docs/r/zurich/api-reference/rest-apis/c_ServiceCatalogAPI.html), ensuring 
+that requests are properly formatted and submitted. Additionally, it will provide feedback to users regarding the status 
+of their requests, including confirmation of submission and any errors encountered during the process. The module will 
+also include logging capabilities to track submissions and facilitate troubleshooting. It will track changes to the 
+ServiceNow catalog item and alert users if there are changes.
+
+The module will be designed like this:
+It will have project settings where users can configure:
+1. The ServiceNow instance URL and authentication credentials (e.g., API token or username/password).
+2. The sys_id of the ServiceNow catalog item they wish to support.
+3. Mapping of REDCap fields to ServiceNow catalog item fields for submission. This will be a JSON string field.
+
+The actual configuration will happen on a module page, with a project link. That page will show inputs for the ServiceNow instance URL, authentication credentials (the module will use basic auth - username and password), sys_id of the catalog item, and a nice looking interface for mapping REDCap fields to ServiceNow catalog item fields. The mapping interface will allow users to select REDCap fields and specify how they correspond to the fields in the ServiceNow catalog item. The ServiceNow API will be used to retrieve the catalog item fields and display them in the mapping interface, allowing users to easily map their REDCap fields to the appropriate ServiceNow fields. It will show the variable types, name, display name, and any other relevant information to help users make informed mapping decisions such as if they are required, active/inactive, readonly, etc. The module will also include validation to ensure that the mappings are correct and complete before allowing users to submit requests.
+
+The bootstrap framework will be used to create a responsive and user-friendly interface for the page. It will not use react or vue, but will rely on vanilla javascript and jQuery for any necessary dynamic behavior. The module will also include error handling and logging capabilities to track submissions and facilitate troubleshooting. It will log all requests made to the ServiceNow API, including the request payload, response status, and any errors encountered during the process. This will allow users to easily identify and resolve any issues that may arise during the submission process.

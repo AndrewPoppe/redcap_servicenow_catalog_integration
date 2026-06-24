@@ -1,0 +1,89 @@
+{
+    "name": "REDCap ServiceNow Catalog Integration",
+    "namespace": "YaleREDCap\\REDCapServiceNowCatalogIntegration",
+    "description": "Integrates REDCap with a ServiceNow catalog, allowing users to submit requests directly from REDCap by mapping REDCap fields to ServiceNow catalog item fields. Tracks changes to configured catalog items and alerts users when changes are detected.",
+    "documentation": "README.md",
+    "authors": [
+        {
+            "name": "Andrew Poppe",
+            "email": "andrew.poppe@yale.edu",
+            "institution": "Yale University"
+        }
+    ],
+    "framework-version": 14,
+    "links": {
+        "project": [
+            {
+                "name": "ServiceNow Catalog Configuration",
+                "icon": "fas fa-cogs",
+                "url": "pages/config.php",
+                "show-header-and-footer": true
+            }
+        ]
+    },
+    "project-settings": [
+        {
+            "key": "servicenow-instance-url",
+            "name": "ServiceNow Instance URL",
+            "type": "text",
+            "required": false,
+            "hidden": true
+        },
+        {
+            "key": "servicenow-username",
+            "name": "ServiceNow Username",
+            "type": "text",
+            "required": false,
+            "hidden": true
+        },
+        {
+            "key": "servicenow-password",
+            "name": "ServiceNow Password",
+            "type": "password",
+            "required": false,
+            "hidden": true
+        },
+        {
+            "key": "servicenow-catalog-sys-id",
+            "name": "ServiceNow Catalog Item sys_id",
+            "type": "text",
+            "required": false,
+            "hidden": true
+        },
+        {
+            "key": "field-mappings",
+            "name": "Field Mappings (JSON)",
+            "type": "json",
+            "required": false,
+            "hidden": true
+        },
+        {
+            "key": "catalog-item-snapshot",
+            "name": "Catalog Item Field Snapshot (JSON)",
+            "type": "json",
+            "required": false,
+            "hidden": true
+        }
+    ],
+    "crons": [
+        {
+            "cron_name": "check_catalog_changes",
+            "cron_description": "Checks for changes to the configured ServiceNow catalog item daily and alerts project users if changes are detected.",
+            "method": "checkCatalogChanges",
+            "cron_frequency": "86400",
+            "cron_max_run_time": "120"
+        }
+    ],
+    "enable-ajax-logging": true,
+    "auth-ajax-actions": [
+        "getServiceNowFields",
+        "saveConfiguration",
+        "saveConnectionSettings",
+        "submitCatalogRequest",
+        "testConnection"
+    ],
+    "compatibility": {
+        "php-version-min": "7.4.0",
+        "redcap-version-min": "13.0.0"
+    }
+}
