@@ -14,7 +14,7 @@
     "links": {
         "project": [
             {
-                "name": "ServiceNow Catalog Configuration",
+                "name": "ServiceNow Catalog Integration",
                 "icon": "fas fa-cogs",
                 "url": "pages/config.php",
                 "show-header-and-footer": true
@@ -115,6 +115,7 @@
     "auth-ajax-actions": [
         "deleteCatalogItem",
         "getServiceNowFields",
+        "getSubmissionLog",
         "saveCatalogItem",
         "saveConnectionSettings",
         "submitCatalogRequest",

@@ -127,7 +127,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             $this->debug("[$itemLabel] RITM submission response", [
                 'success'     => $result['success'],
                 'http_code'   => $result['httpCode']               ?? null,
-                'ritm_number' => $result['data']['request_number'] ?? null,
+                'request_number' => $result['data']['request_number'] ?? null,
                 'error'       => $result['error']                  ?? null,
             ]);
 
@@ -140,7 +140,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                     'instance'      => $repeat_instance,
                     'catalog_label' => $item['label'] ?? '',
                     'http_code'     => $result['httpCode']               ?? null,
-                    'ritm_number'   => $result['data']['request_number'] ?? null,
+                    'request_number'   => $result['data']['request_number'] ?? null,
                     'error'         => $result['error']                  ?? null,
                 ]
             );
@@ -165,9 +165,96 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 return $this->saveCatalogItem($payload);
             case 'deleteCatalogItem':
                 return $this->deleteCatalogItem($payload);
+            case 'getSubmissionLog':
+                return $this->getSubmissionLog($payload);
             default:
                 return ['success' => false, 'error' => 'Unknown action.'];
         }
+    }
+
+    /** Log message written for a successful RITM submission. */
+    private const RITM_SUCCESS_MESSAGE = 'ServiceNow RITM submission succeeded';
+
+    /**
+     * Server-side DataTables endpoint for the RITM submission log.
+     *
+     * Reads the standard DataTables request parameters (draw, start, length,
+     * search, order) and returns only the requested page of rows so the table
+     * stays performant no matter how large the log grows. All filtering,
+     * ordering and pagination are pushed down to the database via queryLogs().
+     *
+     * @param array $payload DataTables server-side request parameters.
+     * @return array DataTables server-side response (draw/recordsTotal/recordsFiltered/data).
+     */
+    private function getSubmissionLog(array $payload): array
+    {
+        $draw   = isset($payload['draw'])  ? (int) $payload['draw']  : 1;
+        $start  = isset($payload['start']) ? max(0, (int) $payload['start']) : 0;
+        $length = isset($payload['length']) ? (int) $payload['length'] : 10;
+
+        // Clamp page size to a sane upper bound (covers DataTables' "All" = -1).
+        if ($length < 1 || $length > 100) {
+            $length = 100;
+        }
+
+        // Columns exposed to DataTables, in display order. Index → sortable log field.
+        $sortFields = ['timestamp', 'record', 'catalog_label', 'instrument', 'request_number'];
+
+        $orderColIdx = isset($payload['order'][0]['column']) ? (int) $payload['order'][0]['column'] : 0;
+        $orderDir    = (strtolower((string) ($payload['order'][0]['dir'] ?? 'desc')) === 'asc') ? 'asc' : 'desc';
+        $orderField  = $sortFields[$orderColIdx] ?? 'timestamp';
+
+        $searchValue = trim((string) ($payload['search']['value'] ?? ''));
+
+        // ── Unfiltered total ──────────────────────────────────────────────
+        $recordsTotal = (int) $this->framework->countLogs('message = ?', [self::RITM_SUCCESS_MESSAGE]);
+
+        // ── Build the filtered WHERE clause ───────────────────────────────
+        $where  = 'message = ?';
+        $params = [self::RITM_SUCCESS_MESSAGE];
+
+        if ($searchValue !== '') {
+            $like = '%' . $searchValue . '%';
+            $where .= ' and (record like ? or catalog_label like ? or instrument like ? or request_number like ?)';
+            array_push($params, $like, $like, $like, $like);
+        }
+
+        // ── Filtered total ────────────────────────────────────────────────
+        $recordsFiltered = ($searchValue === '')
+            ? $recordsTotal
+            : (int) $this->framework->countLogs($where, $params);
+
+        // ── Page of rows ──────────────────────────────────────────────────
+        // LIMIT values must be integer literals for queryLogs; the casts above
+        // guarantee they are safe to inline.
+        $sql = "select timestamp, record, instrument, catalog_label, request_number, ritm_number"
+             . " where $where"
+             . " order by $orderField $orderDir, log_id $orderDir"
+             . " limit " . (int) $start . ", " . (int) $length;
+
+        $data   = [];
+        $result = $this->framework->queryLogs($sql, $params);
+        while ($row = $result->fetch_assoc()) {
+            $data[] = [
+                // 'log_id'        => $row['log_id'],
+                'timestamp'     => $row['timestamp'],
+                // 'username'      => $row['username'],
+                'record'        => $row['record'],
+                // 'event_id'      => $row['event_id'],
+                'instrument'    => $row['instrument'],
+                // 'instance'      => $row['instance'],
+                'catalog_label' => $row['catalog_label'],
+                'request_number'   => $row['request_number'] ?? $row['ritm_number'],
+                // 'http_code'     => $row['http_code'],
+            ];
+        }
+
+        return [
+            'draw'            => $draw,
+            'recordsTotal'    => $recordsTotal,
+            'recordsFiltered' => $recordsFiltered,
+            'data'            => $data,
+        ];
     }
 
     /**
@@ -191,13 +278,31 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'label'         => (string) ($labels[$i] ?? ''),
                 'active'        => ($actives[$i] ?? '') === '1',
                 'sysId'         => (string) ($sysIds[$i] ?? ''),
-                'fieldMappings' => json_decode($mappings[$i]  ?? '{}',   true) ?? [],
-                'snapshot'      => json_decode($snapshots[$i] ?? 'null', true),
+                'fieldMappings' => $this->decodeProjectSettingJson($mappings[$i] ?? [], []),
+                'snapshot'      => $this->decodeProjectSettingJson($snapshots[$i] ?? null, null),
                 'triggerForm'   => (string) ($forms[$i] ?? ''),
-                'criteria'      => json_decode($criteria[$i]  ?? '[]',   true) ?? [],
+                'criteria'      => $this->decodeProjectSettingJson($criteria[$i] ?? [], []),
             ];
         }
         return $items;
+    }
+
+    private function decodeProjectSettingJson($value, $default)
+    {
+        if (is_array($value)) {
+            return $value;
+        }
+
+        if ($value === null || $value === '') {
+            return $default;
+        }
+
+        if (!is_string($value)) {
+            return $default;
+        }
+
+        $decoded = json_decode($value, true);
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : $default;
     }
 
     private function saveCatalogItem(array $payload): array

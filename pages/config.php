@@ -13,6 +13,8 @@ if (!$module->framework->isSuperUser()) {
 
 $pid = (int) $module->getProjectId();
 
+$recordHomeUrl = APP_PATH_WEBROOT . 'DataEntry/record_home.php?pid=' . $pid;
+
 
 // ─── Page Data ─────────────────────────────────────────────────────────────────
 $savedUrl      = (string) ($module->getProjectSetting('servicenow-instance-url') ?? '');
@@ -81,7 +83,8 @@ foreach ($redcapForms as $form) {
     ];
 }
 ?>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
+<!-- <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/dataTables.bootstrap5.min.css"> -->
 <style>
     #sn-config-page {
         width: 100%;
@@ -127,7 +130,6 @@ foreach ($redcapForms as $form) {
         white-space: nowrap;
     }
     .sn-badge-required { background: #fce4e4; color: #c0392b; border: 1px solid #f1c0c0; }
-    .sn-badge-readonly  { background: #e8f4fd; color: #1a6fa0; border: 1px solid #b8dff5; }
     #test-status { font-size: 0.9rem; }
     #sn-config-page .input-group-append .btn { border-left: 0; }
     #catalog-items-table { margin-bottom: 0; }
@@ -144,6 +146,46 @@ foreach ($redcapForms as $form) {
     #toast-container .toast { width: 100%; }
     /* Make field values modal appear above catalog item modal */
     #field-values-modal { z-index: 1210; }
+    #field-values-modal .modal-dialog {
+        max-width: 640px;
+    }
+    /* #field-values-modal .modal-content {
+        border: 1px solid rgba(13, 42, 74, 0.18);
+        border-radius: 14px;
+        overflow: hidden;
+        box-shadow: 0 1.5rem 3.5rem rgba(7, 28, 52, 0.35), 0 0 0 4px rgba(255, 255, 255, 0.7);
+        background: #ffffff;
+    }
+    #field-values-modal .modal-header {
+        background: linear-gradient(135deg, #123a63 0%, #1d5d8f 100%);
+        color: #fff;
+        border-bottom: none;
+        padding: 0.9rem 1rem;
+    } */
+    #field-values-modal .btn-close {
+        filter: invert(1) grayscale(100%) brightness(200%);
+        opacity: 0.95;
+    }
+    /* #field-values-modal .modal-body {
+        background: linear-gradient(180deg, #f7fbff 0%, #ffffff 100%);
+    }
+    #field-values-modal .table thead th {
+        background: #eaf3fb;
+        color: #123a63;
+        border-bottom-color: #c9dced;
+    }
+    #field-values-modal .table tbody td {
+        vertical-align: middle;
+    }
+    #field-values-modal .table tbody tr:nth-child(even) {
+        background: rgba(18, 58, 99, 0.03);
+    }
+    #field-values-modal .table code {
+        background: #e9f4ff;
+        color: #0d4f82;
+        padding: 2px 6px;
+        border-radius: 4px;
+    } */
 </style>
 
 <div id="sn-config-page" class="py-4 px-3">
@@ -160,6 +202,29 @@ foreach ($redcapForms as $form) {
     </div>
 
     <div id="alert-area" class="mb-3" style="display:none"></div>
+
+    <!-- ── Tab Navigation ──────────────────────────────────────────────── -->
+    <ul class="nav nav-tabs mb-3" id="sn-config-tabs" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="tab-config-btn" data-bs-toggle="tab"
+                    data-bs-target="#tab-config" type="button" role="tab"
+                    aria-controls="tab-config" aria-selected="true">
+                <i class="fas fa-sliders-h mr-1"></i> Configuration
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-log-btn" data-bs-toggle="tab"
+                    data-bs-target="#tab-log" type="button" role="tab"
+                    aria-controls="tab-log" aria-selected="false">
+                <i class="fas fa-clipboard-list mr-1"></i> Submission Log
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content" id="sn-config-tab-content">
+
+    <!-- ════ Configuration Tab ═══════════════════════════════════════════ -->
+    <div class="tab-pane fade show active" id="tab-config" role="tabpanel" aria-labelledby="tab-config-btn">
 
     <!-- ── Connection Settings ──────────────────────────────────────────── -->
     <div class="card shadow-sm mb-4">
@@ -234,7 +299,7 @@ foreach ($redcapForms as $form) {
             <table class="table table-sm table-hover mb-0" id="catalog-items-table" style="display:none">
                 <thead>
                     <tr>
-                        <th style="width:35%">Label</th>
+                        <th style="width:35%" class="ps-3">Label</th>
                         <th style="width:12%">Status</th>
                         <th>Trigger Form</th>
                         <th style="width:160px" class="text-right pr-3">Actions</th>
@@ -244,6 +309,41 @@ foreach ($redcapForms as $form) {
             </table>
         </div>
     </div>
+
+    </div><!-- /#tab-config -->
+
+    <!-- ════ Submission Log Tab ══════════════════════════════════════════ -->
+    <div class="tab-pane fade" id="tab-log" role="tabpanel" aria-labelledby="tab-log-btn">
+
+        <div class="card shadow-sm mb-4">
+            <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                <span><i class="fas fa-clipboard-list mr-1"></i> RITM Submission Log</span>
+                <button class="btn btn-sm btn-light" id="btn-refresh-log" type="button">
+                    <i class="fas fa-sync-alt mr-1"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Every successful ServiceNow request item (RITM) submission is recorded below.
+                </p>
+                <table id="submission-log-table" class="hover w-100">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Record</th>
+                            <th>Catalog Item</th>
+                            <th>Trigger Form</th>
+                            <th>Request Number</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+    </div><!-- /#tab-log -->
+
+    </div><!-- /#sn-config-tab-content -->
 
 </div><!-- /#sn-config-page -->
 
@@ -316,8 +416,6 @@ foreach ($redcapForms as $form) {
                                 For each ServiceNow variable, choose the REDCap field whose value should be submitted.
                                 Variables marked <span class="sn-badge sn-badge-required">Required</span> must be
                                 mapped before saving.
-                                Variables marked <span class="sn-badge sn-badge-readonly">Read-only</span> are
-                                read-only in the ServiceNow UI but can still be mapped for submission.
                             </p>
                         </div>
                         <div class="table-responsive">
@@ -424,11 +522,11 @@ foreach ($redcapForms as $form) {
 
 
 <!-- ── Possible Values Modal ──────────────────────────────────────────────── -->
-<div class="modal fade" id="field-values-modal" tabindex="-1"
+<div class="modal fade bg-black bg-opacity-50" id="field-values-modal" tabindex="-1"
      aria-labelledby="field-values-modal-title" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
         <div class="modal-content">
-            <div class="modal-header">
+            <div class="modal-header bg-info text-white">
                 <h5 class="modal-title" id="field-values-modal-title">Possible Values</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
@@ -440,7 +538,9 @@ foreach ($redcapForms as $form) {
 <div id="toast-container" aria-live="polite" aria-atomic="true"></div>
 
 <?= $module->initializeJavascriptModuleObject() ?>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
+<!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/dataTables.bootstrap5.min.js"></script> -->
 <script>
 $(document).ready(function () {
     'use strict';
@@ -450,8 +550,10 @@ $(document).ready(function () {
     // ── Page-level data from PHP ──────────────────────────────────────────
     let CATALOG_ITEMS = <?= json_encode($catalogItems) ?>;
     const RC_FIELDS   = <?= json_encode($redcapFields) ?>;
-    const RC_FORMS    = <?= json_encode($redcapForms) ?>;
+    const RC_FORMS_JSON    = <?= json_encode($redcapForms) ?>;
+    const RC_FORMS = new Map(RC_FORMS_JSON.map(f => [f.name, f.label]));
     let HAS_PASSWORD  = <?= $hasPassword ? 'true' : 'false' ?>;
+    const RECORD_HOME_URL = <?= json_encode($recordHomeUrl) ?>;
 
     // Structural / display-only types that have no submittable value
     const SKIP_TYPES = ['11', '12', '14', '15', '17', '19', '20', '24', '32'];
@@ -562,7 +664,7 @@ $(document).ready(function () {
     }
 
     function buildRcDropdown(selectedValue) {
-        return '<select class="form-control form-control-sm rc-field-select">' + buildFormGroupedOptions(selectedValue) + '</select>';
+        return '<select class="form-select form-select-sm rc-field-select">' + buildFormGroupedOptions(selectedValue) + '</select>';
     }
 
     function buildValueInput(fieldName, currentValue, hide) {
@@ -575,7 +677,7 @@ $(document).ready(function () {
                 const sel = val === String(currentValue) ? ' selected' : '';
                 opts += '<option value="' + escHtml(val) + '"' + sel + '>' + escHtml(c.label) + '</option>';
             });
-            return '<select class="form-control form-control-sm mr-2 criterion-value" style="' + style + '">' + opts + '</select>';
+            return '<select class="form-select form-select-sm mr-2 criterion-value" style="' + style + '">' + opts + '</select>';
         }
         return '<input type="text" class="form-control form-control-sm mr-2 criterion-value" ' +
                'style="' + style + '" placeholder="Value" value="' + escHtml(String(currentValue)) + '">';
@@ -600,12 +702,12 @@ $(document).ready(function () {
         if (choices.length === 0) {
             body = '<p class="text-muted p-3 mb-0">No values available for this field.</p>';
         } else {
-            body = '<table class="table table-sm table-bordered mb-0">' +
-                   '<thead class="table-light"><tr><th>Label</th><th>Value</th></tr></thead><tbody>';
+            body = '<table class="table table-sm mb-0">' +
+                   '<thead class="table-light"><tr><th class="ps-4">Value</th><th>Label</th></tr></thead><tbody>';
             choices.forEach(function (c) {
                 const lbl = escHtml(c.label ?? c.text ?? c.display_value ?? '');
                 const val = escHtml(String(c.value ?? ''));
-                body += '<tr><td>' + lbl + '</td><td><code>' + val + '</code></td></tr>';
+                body += '<tr><td class="ps-4"><code>' + val + '</code></td><td>' + lbl + '</td></tr>';
             });
             body += '</tbody></table>';
         }
@@ -633,18 +735,18 @@ $(document).ready(function () {
         $('#catalog-items-table').show();
 
         CATALOG_ITEMS.forEach(function (item, index) {
-            const formObj   = RC_FORMS.find(function (f) { return f.name === item.triggerForm; });
-            const formLabel = formObj ? formObj.label : (item.triggerForm || '—');
+            // const formObj   = RC_FORMS.find(function (f) { return f.name === item.triggerForm; });
+            const formLabel = RC_FORMS.get(item.triggerForm) || item.triggerForm || '—';
             const statusBadge = item.active
                 ? '<span class="badge badge-success" style="background:#28a745;color:#fff;padding:3px 8px;border-radius:3px">Active</span>'
                 : '<span class="badge badge-secondary" style="background:#6c757d;color:#fff;padding:3px 8px;border-radius:3px">Inactive</span>';
 
             const $tr = $(
                 '<tr>' +
-                '<td class="align-middle font-weight-bold">' + escHtml(item.label || '(no label)') + '</td>' +
+                '<td class="align-middle font-weight-bold ps-3">' + escHtml(item.label || '(no label)') + '</td>' +
                 '<td class="align-middle">' + statusBadge + '</td>' +
                 '<td class="align-middle"><small class="text-muted">' + escHtml(formLabel) + '</small></td>' +
-                '<td class="align-middle text-right pr-3">' +
+                '<td class="align-middle text-right pe-3">' +
                   '<button class="btn btn-sm btn-outline-primary mr-1 btn-edit-item" data-index="' + index + '" title="Edit">' +
                   '<i class="fas fa-edit mr-1"></i>Edit</button>' +
                   '<button class="btn btn-sm btn-outline-danger btn-delete-item" data-index="' + index + '" data-label="' + escHtml(item.label || '') + '" title="Delete">' +
@@ -739,37 +841,71 @@ $(document).ready(function () {
     });
 
     // ── Mapping Table (inside modal) ──────────────────────────────────────
+    function getServiceNowFieldName(field) {
+        return String((field && (field.name || field.variable_name || field.question_name)) || '');
+    }
+
+    function flattenServiceNowFields(fields) {
+        const flat = [];
+
+        function walk(list, parentLabel) {
+            (Array.isArray(list) ? list : []).forEach(function (field) {
+                const children = Array.isArray(field && field.children) ? field.children : [];
+                const currentLabel = String((field && (field.label || field.display_label || getServiceNowFieldName(field))) || '');
+
+                if (children.length > 0) {
+                    const nextParentLabel = parentLabel || currentLabel;
+                    walk(children, nextParentLabel);
+                    return;
+                }
+
+                const item = Object.assign({}, field || {});
+                if (parentLabel) {
+                    item.__parentLabel = parentLabel;
+                }
+                flat.push(item);
+            });
+        }
+
+        walk(fields, '');
+        return flat;
+    }
+
     function renderMappingTable(fields, savedMap) {
         savedMap = savedMap || {};
+        const normalizedFields = flattenServiceNowFields(fields);
         const $tbody = $('#modal-mapping-tbody').empty();
         let rowCount = 0;
 
-        fields.forEach(function (field) {
-            const name     = String(field.name || '');
+        normalizedFields.forEach(function (field) {
+            const name     = getServiceNowFieldName(field);
             const label    = String(field.label || field.display_label || name);
             const typeKey  = String(field.type || '');
             const type     = String(field.display_type || typeKey);
             const required = String(field.mandatory || field.required || 'false').toLowerCase() === 'true';
             const active   = String(field.active || 'true').toLowerCase() !== 'false';
-            const readOnly = String(field.read_only || 'false').toLowerCase() === 'true';
+            const parentLabel = String(field.__parentLabel || '');
+
+            if (!name) return;
 
             if (SKIP_TYPES.indexOf(typeKey) !== -1 || !active) return;
 
             const savedRcField = savedMap[name] || '';
             let badges = '';
             if (required) badges += '<span class="sn-badge sn-badge-required">Required</span>';
-            if (readOnly) badges += '<span class="sn-badge sn-badge-readonly">Read-only</span>';
 
             const valuesBtn = buildValuesButton(field, typeKey);
             const attrsCell = (badges + (valuesBtn ? ' ' + valuesBtn : '')).trim()
                            || '<span class="text-muted">—</span>';
+            const labelCell = escHtml(label) + (parentLabel
+                ? '<div><small class="text-muted">Set: ' + escHtml(parentLabel) + '</small></div>'
+                : '');
 
             const $tr = $(
                 '<tr data-sn-field="' + escHtml(name) + '"' +
-                    ' data-required="' + required + '"' +
-                    ' data-readonly="' + readOnly + '">' +
+                    ' data-required="' + required + '">' +
                 '<td><code>' + escHtml(name) + '</code></td>' +
-                '<td>' + escHtml(label) + '</td>' +
+                '<td>' + labelCell + '</td>' +
                 '<td><small class="text-muted">' + escHtml(type) + '</small></td>' +
                 '<td>' + attrsCell + '</td>' +
                 '<td>' + buildRcDropdown(savedRcField) + '</td>' +
@@ -817,7 +953,6 @@ $(document).ready(function () {
     function validateMappings() {
         const errors = [];
         $('#modal-mapping-tbody tr[data-required="true"]').each(function () {
-            if ($(this).data('readonly') === true) return;
             const rcField = $(this).find('.rc-field-select').val();
             if (!rcField) errors.push($(this).data('sn-field'));
         });
@@ -902,9 +1037,9 @@ $(document).ready(function () {
 
         return '<div class="d-flex align-items-center mb-2 criterion-row">' +
             '<div class="criterion-field-wrap mr-2" style="flex:0 1 280px;min-width:160px">' +
-            '<select class="form-control form-control-sm criterion-field">' + buildFormGroupedOptions(field) + '</select>' +
+            '<select class="form-select form-select-sm criterion-field">' + buildFormGroupedOptions(field) + '</select>' +
             '</div>' +
-            '<select class="form-control form-control-sm mr-2 criterion-operator" style="max-width:175px">' + opOpts + '</select>' +
+            '<select class="form-select form-select-sm mr-2 criterion-operator" style="max-width:175px">' + opOpts + '</select>' +
             buildValueInput(field, value, hideValue) +
             '<button class="btn btn-sm btn-outline-danger btn-remove-criterion flex-shrink-0 ml-2" type="button" title="Remove">' +
             '<i class="fas fa-times"></i></button></div>';
@@ -1159,6 +1294,68 @@ $(document).ready(function () {
         const show   = $input.attr('type') === 'password';
         $input.attr('type', show ? 'text' : 'password');
         $('#pw-eye-icon').toggleClass('fa-eye fa-eye-slash');
+    });
+
+    // ── Submission Log (server-side DataTable) ────────────────────────────
+    let submissionLogTable = null;
+
+    function buildRecordLink(record) {
+        if (!record) return '';
+        const url = RECORD_HOME_URL + '&id=' + encodeURIComponent(record);
+        return '<a href="' + escHtml(url) + '" target="_blank" rel="noopener">' + escHtml(record) + '</a>';
+    }
+
+    function formLabelFor(name) {
+        return RC_FORMS.get(name) || name || '—';
+    }
+
+    function initSubmissionLogTable() {
+        if (submissionLogTable) {
+            return;
+        }
+        submissionLogTable = $('#submission-log-table').DataTable({
+            serverSide:  true,   // pagination/search/sort handled in PHP → scales to huge logs
+            processing:  true,
+            deferRender: true,
+            order:       [[0, 'desc']],
+            pageLength:  25,
+            lengthMenu:  [[10, 25, 50, 100], [10, 25, 50, 100]],
+            ajax: function (data, callback) {
+                module.ajax('getSubmissionLog', data).then(function (json) {
+                    callback(json);
+                }).catch(function () {
+                    callback({ draw: data.draw, recordsTotal: 0, recordsFiltered: 0, data: [] });
+                    showAlert('danger', 'Failed to load the submission log.');
+                });
+            },
+            columns: [
+                { data: 'timestamp',     render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
+                { data: 'record',        render: function (d, type) { return type === 'display' ? buildRecordLink(d) : (d || ''); } },
+                { data: 'catalog_label', render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
+                { data: 'instrument',    render: function (d, type) { return type === 'display' ? escHtml(formLabelFor(d)) : (d || ''); } },
+                { data: 'request_number',   render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } }
+            ],
+            language: {
+                emptyTable:  'No RITM submissions have been logged yet.',
+                zeroRecords: 'No matching submissions found.'
+            }
+        });
+    }
+
+    // Build the table the first time the Submission Log tab is opened; on later
+    // visits just re-adjust column widths (DataTables miscalculates while hidden).
+    $('#tab-log-btn').on('shown.bs.tab', function () {
+        if (submissionLogTable) {
+            submissionLogTable.columns.adjust();
+        } else {
+            initSubmissionLogTable();
+        }
+    });
+
+    $('#btn-refresh-log').on('click', function () {
+        if (submissionLogTable) {
+            submissionLogTable.ajax.reload(null, false);
+        }
     });
 
 });
