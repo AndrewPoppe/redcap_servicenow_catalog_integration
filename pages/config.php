@@ -18,18 +18,8 @@ $pid = (int) $module->getProjectId();
 $savedUrl      = (string) ($module->getProjectSetting('servicenow-instance-url') ?? '');
 $savedUsername = (string) ($module->getProjectSetting('servicenow-username') ?? '');
 $hasPassword   = !empty($module->getProjectSetting('servicenow-password'));
-$savedSysId    = (string) ($module->getProjectSetting('servicenow-catalog-sys-id') ?? '');
-if (empty($savedSysId) && !empty($snapshot['sys_id'])) {
-    $savedSysId = (string) $snapshot['sys_id'];
-}
-$fieldMappings = $module->getProjectSetting('field-mappings');
-if (is_string($fieldMappings)) {
-    // Handle legacy saves where mappings were stored as a JSON string
-    $fieldMappings = json_decode($fieldMappings, true) ?? [];
-}
-if (!is_array($fieldMappings)) {
-    $fieldMappings = [];
-}
+
+$catalogItems = $module->getCatalogItems();
 
 $metaData     = \REDCap::getDataDictionary('array');
 $redcapFields = [];
@@ -37,26 +27,72 @@ foreach ($metaData as $fieldInfo) {
     if ($fieldInfo['field_type'] === 'descriptive') {
         continue;
     }
+    $fieldChoices = [];
+    switch ($fieldInfo['field_type']) {
+        case 'yesno':
+            $fieldChoices = [['value' => '1', 'label' => 'Yes'], ['value' => '0', 'label' => 'No']];
+            break;
+        case 'truefalse':
+            $fieldChoices = [['value' => '1', 'label' => 'True'], ['value' => '0', 'label' => 'False']];
+            break;
+        case 'radio':
+        case 'select':
+        case 'checkbox':
+            foreach (explode('|', $fieldInfo['select_choices_or_calculations'] ?? '') as $part) {
+                $part = trim($part);
+                if ($part === '') continue;
+                $comma = strpos($part, ',');
+                if ($comma !== false) {
+                    $fieldChoices[] = [
+                        'value' => trim(substr($part, 0, $comma)),
+                        'label' => trim(substr($part, $comma + 1)),
+                    ];
+                }
+            }
+            break;
+    }
     $redcapFields[] = [
-        'name'  => $fieldInfo['field_name'],
-        'label' => strip_tags($fieldInfo['field_label']),
-        'type'  => $fieldInfo['field_type'],
-        'form'  => $fieldInfo['form_name'],
+        'name'    => $fieldInfo['field_name'],
+        'label'   => strip_tags($fieldInfo['field_label']),
+        'type'    => $fieldInfo['field_type'],
+        'form'    => $fieldInfo['form_name'],
+        'choices' => $fieldChoices,
     ];
 }
 
-$snapshot = $module->getProjectSetting('catalog-item-snapshot');
-if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot['variables'])) {
-    $snapshot = null;
+$instrumentNames = \REDCap::getInstrumentNames();
+$redcapForms     = [];
+foreach ($instrumentNames as $formName => $formLabel) {
+    $redcapForms[] = ['name' => $formName, 'label' => $formLabel];
+}
+
+// Append _complete status fields
+foreach ($redcapForms as $form) {
+    $redcapFields[] = [
+        'name'    => $form['name'] . '_complete',
+        'label'   => $form['label'] . ' (completion status)',
+        'type'    => 'complete',
+        'form'    => $form['name'],
+        'choices' => [
+            ['value' => '0', 'label' => 'Incomplete'],
+            ['value' => '1', 'label' => 'Unverified'],
+            ['value' => '2', 'label' => 'Complete'],
+        ],
+    ];
 }
 ?>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
 <style>
+    #sn-config-page {
+        width: 100%;
+        box-sizing: border-box;
+    }
     #sn-config-page .card-header {
         font-weight: 600;
         font-size: 0.95rem;
     }
-    #mapping-table thead th {
+    #mapping-table thead th,
+    #modal-mapping-table thead th {
         font-size: 0.78rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
@@ -64,6 +100,7 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
         border-top: none;
         white-space: nowrap;
     }
+    #modal-mapping-table code,
     #mapping-table code {
         font-size: 0.82em;
         color: #6f42c1;
@@ -71,7 +108,7 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
         padding: 2px 6px;
         border-radius: 3px;
     }
-    #mapping-table tbody tr:hover {
+    #modal-mapping-table tbody tr:hover {
         background-color: #f5f7ff;
     }
     .rc-field-select { min-width: 230px; }
@@ -79,6 +116,7 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
     .select2-container .select2-selection--single { height: 31px; }
     .select2-container--default .select2-selection--single .select2-selection__rendered { line-height: 29px; padding-right: 28px; }
     .select2-container--default .select2-selection--single .select2-selection__arrow { height: 29px; }
+    .criterion-field-wrap .select2-container { min-width: 0; }
     .sn-badge {
         font-size: 0.7em;
         font-weight: 600;
@@ -92,9 +130,23 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
     .sn-badge-readonly  { background: #e8f4fd; color: #1a6fa0; border: 1px solid #b8dff5; }
     #test-status { font-size: 0.9rem; }
     #sn-config-page .input-group-append .btn { border-left: 0; }
+    #catalog-items-table { margin-bottom: 0; }
+    #catalog-items-table th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; background: #f8f9fa; }
+    #catalog-items-empty { padding: 2.5rem 1rem; }
+    #toast-container {
+        position: fixed;
+        bottom: 1.5rem;
+        right:  1.5rem;
+        z-index: 1200;
+        min-width: 300px;
+        max-width: 440px;
+    }
+    #toast-container .toast { width: 100%; }
+    /* Make field values modal appear above catalog item modal */
+    #field-values-modal { z-index: 1210; }
 </style>
 
-<div id="sn-config-page" class="container-fluid py-4">
+<div id="sn-config-page" class="py-4 px-3">
 
     <div class="row mb-3">
         <div class="col">
@@ -102,12 +154,12 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
                 <i class="fas fa-exchange-alt text-primary mr-2"></i>ServiceNow Catalog Integration
             </h3>
             <p class="text-muted mb-0">
-                Configure the connection to your ServiceNow instance and map REDCap fields to the selected catalog item.
+                Configure the connection to your ServiceNow instance and manage catalog item integrations.
             </p>
         </div>
     </div>
 
-    <div id="alert-area" class="mb-3"></div>
+    <div id="alert-area" class="mb-3" style="display:none"></div>
 
     <!-- ── Connection Settings ──────────────────────────────────────────── -->
     <div class="card shadow-sm mb-4">
@@ -166,79 +218,226 @@ if (!is_array($snapshot) || empty($snapshot['variables']) || !is_array($snapshot
         </div>
     </div>
 
-    <!-- ── Catalog Item ──────────────────────────────────────────────────── -->
+    <!-- ── Catalog Items ─────────────────────────────────────────────────── -->
     <div class="card shadow-sm mb-4">
-        <div class="card-header bg-primary text-white">
-            <i class="fas fa-list-alt mr-1"></i> Catalog Item
-        </div>
-        <div class="card-body">
-
-            <div class="form-group mb-0">
-                <label for="catalog-sys-id" class="font-weight-bold">Catalog Item sys_id</label>
-                <div class="input-group" style="max-width:540px">
-                    <input type="text" class="form-control" id="catalog-sys-id"
-                           style="font-family:monospace"
-                           placeholder="e.g. 1a2b3c4d5e6f7890abcdef1234567890"
-                           maxlength="32"
-                           value="<?= htmlspecialchars($savedSysId, ENT_QUOTES) ?>">
-                    <div class="input-group-append">
-                        <button class="btn btn-primary" id="btn-fetch" type="button">
-                            <i class="fas fa-sync-alt mr-1"></i> Load Fields
-                        </button>
-                    </div>
-                </div>
-                <small class="form-text text-muted">
-                    The 32-character hexadecimal sys_id of the ServiceNow catalog item.
-                </small>
-            </div>
-
-        </div>
-    </div>
-
-    <!-- ── Field Mapping ─────────────────────────────────────────────────── -->
-    <div class="card shadow-sm mb-4" id="mapping-card" style="display:none">
         <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
-            <span><i class="fas fa-map-signs mr-1"></i> Field Mapping</span>
-            <span class="badge badge-light text-dark px-2 py-1" id="mapping-count"></span>
+            <span><i class="fas fa-list mr-1"></i> Catalog Items</span>
+            <button class="btn btn-sm btn-light" id="btn-add-catalog-item" type="button">
+                <i class="fas fa-plus mr-1"></i> Add Catalog Item
+            </button>
         </div>
         <div class="card-body p-0">
-            <div class="p-3 border-bottom bg-light">
-                <p class="mb-0 text-muted small">
-                    For each ServiceNow variable, choose the REDCap field whose value should be submitted.
-                    Variables marked <span class="sn-badge sn-badge-required">Required</span> must be
-                    mapped before saving.
-                    Variables marked <span class="sn-badge sn-badge-readonly">Read-only</span> are
-                    read-only in the ServiceNow UI but can still be mapped for submission.
-                </p>
+            <div id="catalog-items-empty" class="text-center text-muted" style="display:none">
+                <i class="fas fa-inbox fa-2x mb-2 d-block text-secondary"></i>
+                No catalog items configured. Click <strong>Add Catalog Item</strong> to get started.
             </div>
-            <div class="table-responsive">
-                <table class="table table-sm table-hover mb-0" id="mapping-table">
-                    <thead>
-                        <tr>
-                            <th>Variable Name</th>
-                            <th>Display Label</th>
-                            <th>Type</th>
-                            <th>Attributes</th>
-                            <th>REDCap Field</th>
-                        </tr>
-                    </thead>
-                    <tbody id="mapping-tbody"></tbody>
-                </table>
-            </div>
+            <table class="table table-sm table-hover mb-0" id="catalog-items-table" style="display:none">
+                <thead>
+                    <tr>
+                        <th style="width:35%">Label</th>
+                        <th style="width:12%">Status</th>
+                        <th>Trigger Form</th>
+                        <th style="width:160px" class="text-right pr-3">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="catalog-items-tbody"></tbody>
+            </table>
         </div>
-    </div>
-
-    <!-- ── Actions ───────────────────────────────────────────────────────── -->
-    <div class="mb-5">
-        <button class="btn btn-success btn-lg" id="btn-save" type="button" disabled>
-            <i class="fas fa-save mr-1"></i> Save Configuration
-        </button>
-        <button class="btn btn-outline-secondary btn-lg ml-2" id="btn-reload" type="button" style="display:none">
-            <i class="fas fa-sync-alt mr-1"></i> Reload Fields
-        </button>
     </div>
 
 </div><!-- /#sn-config-page -->
+
+
+<!-- ── Catalog Item Modal (XL) ───────────────────────────────────────────── -->
+<div class="modal fade" id="catalog-item-modal" tabindex="-1"
+     aria-labelledby="catalog-item-modal-title" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title" id="catalog-item-modal-title">Add Catalog Item</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+
+            <div class="modal-body">
+
+                <!-- General Settings -->
+                <div class="card shadow-sm mb-4">
+                    <div class="card-header">
+                        <i class="fas fa-info-circle mr-1"></i> General Settings
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label for="modal-item-label" class="font-weight-bold">
+                                Label <span class="text-danger">*</span>
+                            </label>
+                            <input type="text" class="form-control" id="modal-item-label"
+                                   style="max-width:420px"
+                                   placeholder="e.g. IT Access Request">
+                            <small class="form-text text-muted">A descriptive name to identify this catalog item configuration.</small>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="modal-item-active" checked>
+                            <label class="form-check-label font-weight-bold" for="modal-item-active">Active</label>
+                            <div><small class="text-muted">When unchecked, this catalog item will not be triggered even if its conditions are met.</small></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Catalog Item & Field Mapping -->
+                <div class="card shadow-sm mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span><i class="fas fa-map-signs mr-1"></i> Catalog Item &amp; Field Mapping</span>
+                        <span class="badge bg-light text-dark px-2 py-1" id="modal-mapping-count" style="display:none"></span>
+                    </div>
+                    <div class="card-body border-bottom">
+                        <div class="form-group mb-0">
+                            <label for="modal-item-sys-id" class="font-weight-bold">
+                                Catalog Item sys_id <span class="text-danger">*</span>
+                            </label>
+                            <div class="input-group" style="max-width:540px">
+                                <input type="text" class="form-control" id="modal-item-sys-id"
+                                       style="font-family:monospace"
+                                       placeholder="e.g. 1a2b3c4d5e6f7890abcdef1234567890"
+                                       maxlength="32">
+                                <div class="input-group-append">
+                                    <button class="btn btn-primary" id="btn-modal-fetch" type="button">
+                                        <i class="fas fa-sync-alt mr-1"></i> Load Fields
+                                    </button>
+                                </div>
+                            </div>
+                            <small class="form-text text-muted">The 32-character hexadecimal sys_id of the ServiceNow catalog item.</small>
+                        </div>
+                    </div>
+                    <div id="modal-mapping-table-section" style="display:none">
+                        <div class="p-3 border-bottom bg-light">
+                            <p class="mb-0 text-muted small">
+                                For each ServiceNow variable, choose the REDCap field whose value should be submitted.
+                                Variables marked <span class="sn-badge sn-badge-required">Required</span> must be
+                                mapped before saving.
+                                Variables marked <span class="sn-badge sn-badge-readonly">Read-only</span> are
+                                read-only in the ServiceNow UI but can still be mapped for submission.
+                            </p>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-sm table-hover mb-0" id="modal-mapping-table">
+                                <thead>
+                                    <tr>
+                                        <th>Variable Name</th>
+                                        <th>Display Label</th>
+                                        <th>Type</th>
+                                        <th>Attributes</th>
+                                        <th>REDCap Field</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="modal-mapping-tbody"></tbody>
+                            </table>
+                        </div>
+                        <div class="card-body border-top">
+                            <button class="btn btn-sm btn-outline-secondary" id="btn-modal-reload" type="button">
+                                <i class="fas fa-sync-alt mr-1"></i> Reload Fields
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trigger Settings -->
+                <div class="card shadow-sm mb-2">
+                    <div class="card-header">
+                        <i class="fas fa-bolt mr-1"></i> Trigger Settings
+                    </div>
+                    <div class="card-body">
+
+                        <div class="form-group">
+                            <label for="modal-trigger-form-select" class="font-weight-bold">Trigger Form</label>
+                            <select class="form-control" id="modal-trigger-form-select" style="max-width:420px">
+                                <option value="">— Select a form —</option>
+                                <?php foreach ($redcapForms as $form): ?>
+                                <option value="<?= htmlspecialchars($form['name'], ENT_QUOTES) ?>">
+                                    <?= htmlspecialchars($form['label'], ENT_QUOTES) ?> [<?= htmlspecialchars($form['name'], ENT_QUOTES) ?>]
+                                </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <small class="form-text text-muted">
+                                When this instrument is saved, the module evaluates the criteria below and
+                                pushes the record to ServiceNow if all conditions are met.
+                            </small>
+                        </div>
+
+                        <hr class="my-3">
+
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <label class="font-weight-bold mb-0">
+                                Push Criteria
+                                <small class="font-weight-normal text-muted ml-1">(optional — all conditions must pass)</small>
+                            </label>
+                            <button class="btn btn-sm btn-outline-secondary" id="btn-modal-add-criterion" type="button">
+                                <i class="fas fa-plus mr-1"></i> Add Criterion
+                            </button>
+                        </div>
+
+                        <div id="modal-criteria-container"></div>
+                        <p id="modal-criteria-empty" class="text-muted small mb-0">
+                            No criteria — the push will fire on every save of the trigger form.
+                        </p>
+
+                    </div>
+                </div>
+
+            </div><!-- /.modal-body -->
+
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-success" id="btn-modal-save">
+                    <i class="fas fa-save mr-1"></i> Save Catalog Item
+                </button>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+
+<!-- ── Delete Confirmation Modal ─────────────────────────────────────────── -->
+<div class="modal fade" id="delete-confirm-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Confirm Delete</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to delete the catalog item
+                   "<strong id="confirm-delete-label"></strong>"?</p>
+                <p class="text-danger mb-0"><small><i class="fas fa-exclamation-triangle mr-1"></i>This action cannot be undone.</small></p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btn-confirm-delete">
+                    <i class="fas fa-trash mr-1"></i> Delete
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- ── Possible Values Modal ──────────────────────────────────────────────── -->
+<div class="modal fade" id="field-values-modal" tabindex="-1"
+     aria-labelledby="field-values-modal-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="field-values-modal-title">Possible Values</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body p-0" id="field-values-modal-body"></div>
+        </div>
+    </div>
+</div>
+
+<div id="toast-container" aria-live="polite" aria-atomic="true"></div>
 
 <?= $module->initializeJavascriptModuleObject() ?>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
@@ -248,58 +447,84 @@ $(document).ready(function () {
 
     const module = <?= $module->getJavascriptModuleObjectName() ?>;
 
-    const SAVED_MAP    = <?= json_encode($fieldMappings) ?>;
-    const RC_FIELDS    = <?= json_encode($redcapFields) ?>;
-    let HAS_PASSWORD = <?= $hasPassword ? 'true' : 'false' ?>;
-    const SNAPSHOT     = <?= json_encode($snapshot) ?>;
+    // ── Page-level data from PHP ──────────────────────────────────────────
+    let CATALOG_ITEMS = <?= json_encode($catalogItems) ?>;
+    const RC_FIELDS   = <?= json_encode($redcapFields) ?>;
+    const RC_FORMS    = <?= json_encode($redcapForms) ?>;
+    let HAS_PASSWORD  = <?= $hasPassword ? 'true' : 'false' ?>;
 
-    // ServiceNow catalog variable type codes → labels
-    const SN_VAR_TYPES = {
-        '1':  'Single Line Text',
-        '2':  'Multi Line Text',
-        '3':  'Multiple Choice',
-        '4':  'Check Box',
-        '5':  'Reference',
-        '6':  'Date',
-        '7':  'Date/Time',
-        '8':  'List Collector',
-        '9':  'Lookup Select Box',
-        '13': 'Label',
-        '14': 'Requested Item Variable',
-        '15': 'Scale',
-        '16': 'Wide Single Line Text',
-        '18': 'Masked',
-        '19': 'Email',
-        '20': 'URL',
-        '21': 'Map',
-        '23': 'Numeric Scale',
-        '24': 'Signature'
+    // Structural / display-only types that have no submittable value
+    const SKIP_TYPES = ['11', '12', '14', '15', '17', '19', '20', '24', '32'];
+
+    // Fixed choices for types whose options never change
+    const FIXED_VALUE_TYPES = {
+        '1': [ { label: 'Yes', value: 'true'  },
+               { label: 'No',  value: 'false' } ],
+        '7': [ { label: 'Checked',   value: 'true'  },
+               { label: 'Unchecked', value: 'false' } ]
     };
 
-    // Structural / display-only variable types that cannot be mapped
-    const SKIP_TYPES = ['11', '12', '13', '22'];
+    // Types that MAY have choices supplied by the API
+    const CHOICE_TYPES = ['3', '5', '18', '22'];
+
+    // Quick lookup: RC field name → choices array
+    const RC_FIELD_CHOICES = {};
+    RC_FIELDS.forEach(function (f) {
+        if (Array.isArray(f.choices) && f.choices.length > 0) {
+            RC_FIELD_CHOICES[f.name] = f.choices;
+        }
+    });
+
+    // ── Modal state ───────────────────────────────────────────────────────
+    let pendingModalItem    = null;   // { index, label, active, sysId, ... } or { index: null }
+    let modalCurrentSnapshot = null; // { sys_id, variables, fetched_at }
+    let pendingDeleteIndex  = null;
+
+    // Bootstrap modal instances
+    const catalogItemModal  = new bootstrap.Modal(document.getElementById('catalog-item-modal'), { backdrop: 'static', keyboard: false });
+    const deleteConfirmModal = new bootstrap.Modal(document.getElementById('delete-confirm-modal'));
+    let fieldValuesModal    = null;
+
+    const CRITERION_OPERATORS = [
+        { value: 'eq',        label: 'equals' },
+        { value: 'neq',       label: 'does not equal' },
+        { value: 'contains',  label: 'contains' },
+        { value: 'not_empty', label: 'is not empty' },
+        { value: 'empty',     label: 'is empty' }
+    ];
 
     // ── Utilities ─────────────────────────────────────────────────────────
     function escHtml(str) {
         return $('<span>').text(String(str == null ? '' : str)).html();
     }
 
-    function resolveType(t) {
-        const key = String(t || '');
-        return SN_VAR_TYPES[key] || (key !== '' ? key : 'Unknown');
-    }
-
     function showAlert(type, message, autoDismiss) {
-        const icons = { success: 'check-circle', warning: 'exclamation-triangle', danger: 'times-circle', info: 'info-circle' };
-        const html  = '<div class="alert alert-' + type + ' alert-dismissible fade show" role="alert">' +
-                    '<i class="fas fa-' + (icons[type] || 'info-circle') + ' mr-1"></i> ' + message +
-                    '<button type="button" class="close" data-dismiss="alert"><span>&times;</span></button>' +
-                    '</div>';
-        $('#alert-area').html(html);
-        if (autoDismiss) {
-            setTimeout(function () { $('#alert-area .alert').alert('close'); }, 5000);
-        }
-        $('html, body').animate({ scrollTop: 0 }, 250);
+        const icons  = { success: 'check-circle', warning: 'exclamation-triangle', danger: 'times-circle', info: 'info-circle' };
+        const bgs    = { success: 'bg-success', warning: 'bg-warning', danger: 'bg-danger', info: 'bg-info' };
+        const titles = { success: 'Success', warning: 'Warning', danger: 'Error', info: 'Info' };
+
+        const icon      = icons[type]  || 'info-circle';
+        const bg        = bgs[type]    || 'bg-secondary';
+        const title     = titles[type] || 'Notice';
+        const whiteText = type !== 'warning';
+        const headerCls = bg + (whiteText ? ' text-white' : '');
+        const closeCls  = 'btn-close ms-2' + (whiteText ? ' btn-close-white' : '');
+
+        const $toast = $(
+            '<div class="toast shadow mb-2" role="alert" aria-live="assertive" aria-atomic="true">' +
+            '<div class="toast-header ' + headerCls + '">' +
+            '<i class="fas fa-' + icon + ' me-2"></i>' +
+            '<strong class="me-auto">' + title + '</strong>' +
+            '<button type="button" class="' + closeCls + '" data-bs-dismiss="toast" aria-label="Close"></button>' +
+            '</div>' +
+            '<div class="toast-body">' + message + '</div>' +
+            '</div>'
+        );
+
+        $('#toast-container').append($toast);
+        const bsToast = new bootstrap.Toast($toast[0], { autohide: !!autoDismiss, delay: 5000 });
+        bsToast.show();
+        $toast[0].addEventListener('hidden.bs.toast', function () { $(this).remove(); });
     }
 
     function getCredentials() {
@@ -307,13 +532,12 @@ $(document).ready(function () {
         return {
             instanceUrl: $('#instance-url').val().trim(),
             username:    $('#sn-username').val().trim(),
-            // Send sentinel when no new password typed but one is saved server-side
             password:    pw !== '' ? pw : (HAS_PASSWORD ? '__SAVED__' : '')
         };
     }
 
-    // ── REDCap field dropdown ─────────────────────────────────────────────
-    function buildRcDropdown(selectedValue) {
+    // ── REDCap field dropdown builders ────────────────────────────────────
+    function buildFormGroupedOptions(selectedValue) {
         const formOrder = [];
         const byForm    = {};
         RC_FIELDS.forEach(function (f) {
@@ -323,8 +547,6 @@ $(document).ready(function () {
             }
             byForm[f.form].push(f);
         });
-
-        // Empty first option required for Select2 placeholder + allowClear
         let opts = '<option value=""></option>';
         formOrder.forEach(function (form) {
             const formLabel = form.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
@@ -336,80 +558,255 @@ $(document).ready(function () {
             });
             opts += '</optgroup>';
         });
-
-        return '<select class="form-control form-control-sm rc-field-select">' + opts + '</select>';
+        return opts;
     }
 
-    // ── Render mapping table ──────────────────────────────────────────────
-    function renderMappingTable(fields) {
-        const tbody = $('#mapping-tbody').empty();
+    function buildRcDropdown(selectedValue) {
+        return '<select class="form-control form-control-sm rc-field-select">' + buildFormGroupedOptions(selectedValue) + '</select>';
+    }
+
+    function buildValueInput(fieldName, currentValue, hide) {
+        const style   = 'max-width:200px' + (hide ? ';display:none' : '');
+        const choices = fieldName ? (RC_FIELD_CHOICES[fieldName] || null) : null;
+        if (choices) {
+            let opts = '<option value=""></option>';
+            choices.forEach(function (c) {
+                const val = String(c.value);
+                const sel = val === String(currentValue) ? ' selected' : '';
+                opts += '<option value="' + escHtml(val) + '"' + sel + '>' + escHtml(c.label) + '</option>';
+            });
+            return '<select class="form-control form-control-sm mr-2 criterion-value" style="' + style + '">' + opts + '</select>';
+        }
+        return '<input type="text" class="form-control form-control-sm mr-2 criterion-value" ' +
+               'style="' + style + '" placeholder="Value" value="' + escHtml(String(currentValue)) + '">';
+    }
+
+    function buildValuesButton(field, typeKey) {
+        const hasFixed   = Object.prototype.hasOwnProperty.call(FIXED_VALUE_TYPES, typeKey);
+        const hasChoices = CHOICE_TYPES.indexOf(typeKey) !== -1 &&
+                           Array.isArray(field.choices) && field.choices.length > 0;
+        if (!hasFixed && !hasChoices) return '';
+        return '<button class="btn btn-link btn-sm p-0 ms-1 btn-show-values align-middle" ' +
+               'title="View possible values"><i class="fas fa-list-ul text-secondary"></i></button>';
+    }
+
+    function showFieldValues(field) {
+        const typeKey = String(field.type || '');
+        const choices = FIXED_VALUE_TYPES[typeKey] ||
+                        (Array.isArray(field.choices) ? field.choices : []);
+        const title   = (field.label || field.name || 'Field') + ' — Possible Values';
+
+        let body;
+        if (choices.length === 0) {
+            body = '<p class="text-muted p-3 mb-0">No values available for this field.</p>';
+        } else {
+            body = '<table class="table table-sm table-bordered mb-0">' +
+                   '<thead class="table-light"><tr><th>Label</th><th>Value</th></tr></thead><tbody>';
+            choices.forEach(function (c) {
+                const lbl = escHtml(c.label ?? c.text ?? c.display_value ?? '');
+                const val = escHtml(String(c.value ?? ''));
+                body += '<tr><td>' + lbl + '</td><td><code>' + val + '</code></td></tr>';
+            });
+            body += '</tbody></table>';
+        }
+
+        document.getElementById('field-values-modal-title').textContent = title;
+        document.getElementById('field-values-modal-body').innerHTML    = body;
+
+        if (!fieldValuesModal) {
+            fieldValuesModal = new bootstrap.Modal(document.getElementById('field-values-modal'));
+        }
+        fieldValuesModal.show();
+    }
+
+    // ── Catalog Items Table ───────────────────────────────────────────────
+    function renderCatalogItemsTable() {
+        const $tbody = $('#catalog-items-tbody').empty();
+
+        if (!CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
+            $('#catalog-items-empty').show();
+            $('#catalog-items-table').hide();
+            return;
+        }
+
+        $('#catalog-items-empty').hide();
+        $('#catalog-items-table').show();
+
+        CATALOG_ITEMS.forEach(function (item, index) {
+            const formObj   = RC_FORMS.find(function (f) { return f.name === item.triggerForm; });
+            const formLabel = formObj ? formObj.label : (item.triggerForm || '—');
+            const statusBadge = item.active
+                ? '<span class="badge badge-success" style="background:#28a745;color:#fff;padding:3px 8px;border-radius:3px">Active</span>'
+                : '<span class="badge badge-secondary" style="background:#6c757d;color:#fff;padding:3px 8px;border-radius:3px">Inactive</span>';
+
+            const $tr = $(
+                '<tr>' +
+                '<td class="align-middle font-weight-bold">' + escHtml(item.label || '(no label)') + '</td>' +
+                '<td class="align-middle">' + statusBadge + '</td>' +
+                '<td class="align-middle"><small class="text-muted">' + escHtml(formLabel) + '</small></td>' +
+                '<td class="align-middle text-right pr-3">' +
+                  '<button class="btn btn-sm btn-outline-primary mr-1 btn-edit-item" data-index="' + index + '" title="Edit">' +
+                  '<i class="fas fa-edit mr-1"></i>Edit</button>' +
+                  '<button class="btn btn-sm btn-outline-danger btn-delete-item" data-index="' + index + '" data-label="' + escHtml(item.label || '') + '" title="Delete">' +
+                  '<i class="fas fa-trash"></i></button>' +
+                '</td>' +
+                '</tr>'
+            );
+            $tbody.append($tr);
+        });
+    }
+
+    // Initial render
+    renderCatalogItemsTable();
+
+    // ── Open Catalog Item Modal ───────────────────────────────────────────
+    function openCatalogItemModal(index) {
+        resetModal();
+
+        if (index !== null && index !== undefined && CATALOG_ITEMS[index] !== undefined) {
+            const item = CATALOG_ITEMS[index];
+            pendingModalItem = Object.assign({}, item, { index: index });
+            $('#catalog-item-modal-title').text('Edit Catalog Item');
+            $('#modal-item-label').val(item.label || '');
+            $('#modal-item-active').prop('checked', !!item.active);
+            $('#modal-item-sys-id').val(item.sysId || '');
+        } else {
+            pendingModalItem = { index: null };
+            $('#catalog-item-modal-title').text('Add Catalog Item');
+            $('#modal-item-active').prop('checked', true);
+        }
+
+        catalogItemModal.show();
+    }
+
+    function resetModal() {
+        // Destroy any existing Select2 instances inside the modal
+        $('#catalog-item-modal .select2-hidden-accessible').each(function () {
+            try { $(this).select2('destroy'); } catch (e) {}
+        });
+
+        $('#modal-item-label').val('');
+        $('#modal-item-active').prop('checked', true);
+        $('#modal-item-sys-id').val('');
+        $('#modal-mapping-table-section').hide();
+        $('#modal-mapping-tbody').empty();
+        $('#modal-mapping-count').hide().text('');
+        $('#modal-criteria-container').empty();
+        $('#modal-criteria-empty').show();
+        modalCurrentSnapshot = null;
+    }
+
+    // After modal fully shown: init Select2, restore saved values, render table/criteria
+    $('#catalog-item-modal').on('shown.bs.modal', function () {
+        const item = pendingModalItem;
+
+        // Trigger form Select2
+        $('#modal-trigger-form-select').select2({
+            width:          '100%',
+            placeholder:    '— Select a form —',
+            allowClear:     true,
+            dropdownParent: $('#catalog-item-modal')
+        });
+
+        if (item && item.triggerForm) {
+            $('#modal-trigger-form-select').val(item.triggerForm).trigger('change');
+        }
+
+        // Criteria
+        if (item && item.criteria && item.criteria.length > 0) {
+            renderModalCriteria(item.criteria);
+        }
+
+        // Mapping table from snapshot
+        if (item && item.snapshot && Array.isArray(item.snapshot.variables) && item.snapshot.variables.length > 0) {
+            modalCurrentSnapshot = item.snapshot;
+            renderMappingTable(item.snapshot.variables, item.fieldMappings || {});
+        }
+    });
+
+    $('#catalog-item-modal').on('hidden.bs.modal', function () {
+        resetModal();
+        pendingModalItem = null;
+    });
+
+    // Edit / Add buttons
+    $('#btn-add-catalog-item').on('click', function () {
+        openCatalogItemModal(null);
+    });
+
+    $('#catalog-items-tbody').on('click', '.btn-edit-item', function () {
+        openCatalogItemModal(parseInt($(this).data('index'), 10));
+    });
+
+    // ── Mapping Table (inside modal) ──────────────────────────────────────
+    function renderMappingTable(fields, savedMap) {
+        savedMap = savedMap || {};
+        const $tbody = $('#modal-mapping-tbody').empty();
         let rowCount = 0;
 
         fields.forEach(function (field) {
             const name     = String(field.name || '');
             const label    = String(field.label || field.display_label || name);
             const typeKey  = String(field.type || '');
-            const type     = resolveType(typeKey);
+            const type     = String(field.display_type || typeKey);
             const required = String(field.mandatory || field.required || 'false').toLowerCase() === 'true';
             const active   = String(field.active || 'true').toLowerCase() !== 'false';
             const readOnly = String(field.read_only || 'false').toLowerCase() === 'true';
 
-            if (SKIP_TYPES.indexOf(typeKey) !== -1 || !active) {
-                return; // skip structural / inactive variables
-            }
+            if (SKIP_TYPES.indexOf(typeKey) !== -1 || !active) return;
 
-            const savedRcField = SAVED_MAP[name] || '';
+            const savedRcField = savedMap[name] || '';
             let badges = '';
             if (required) badges += '<span class="sn-badge sn-badge-required">Required</span>';
             if (readOnly) badges += '<span class="sn-badge sn-badge-readonly">Read-only</span>';
 
-            const rcCell = buildRcDropdown(savedRcField);
+            const valuesBtn = buildValuesButton(field, typeKey);
+            const attrsCell = (badges + (valuesBtn ? ' ' + valuesBtn : '')).trim()
+                           || '<span class="text-muted">—</span>';
 
-            tbody.append(
+            const $tr = $(
                 '<tr data-sn-field="' + escHtml(name) + '"' +
                     ' data-required="' + required + '"' +
                     ' data-readonly="' + readOnly + '">' +
                 '<td><code>' + escHtml(name) + '</code></td>' +
                 '<td>' + escHtml(label) + '</td>' +
                 '<td><small class="text-muted">' + escHtml(type) + '</small></td>' +
-                '<td>' + (badges || '<span class="text-muted">—</span>') + '</td>' +
-                '<td>' + rcCell + '</td>' +
+                '<td>' + attrsCell + '</td>' +
+                '<td>' + buildRcDropdown(savedRcField) + '</td>' +
                 '</tr>'
             );
+            $tr.data('sn-field-data', field);
+            $tbody.append($tr);
             rowCount++;
         });
 
         if (rowCount === 0) {
-            tbody.append('<tr><td colspan="5" class="text-center text-muted py-3">' +
-                         'No mappable variables found for this catalog item.</td></tr>');
+            $tbody.append('<tr><td colspan="5" class="text-center text-muted py-3">' +
+                          'No mappable variables found for this catalog item.</td></tr>');
         }
 
-        $('#mapping-count').text(rowCount + ' variable' + (rowCount !== 1 ? 's' : ''));
-        $('#mapping-card').fadeIn(200);
-        $('#btn-save').prop('disabled', false);
-        $('#btn-reload').show();
+        $('#modal-mapping-count').text(rowCount + ' variable' + (rowCount !== 1 ? 's' : '')).show();
+        $('#modal-mapping-table-section').slideDown(200);
 
-        // Initialise Select2 on all dropdowns, then restore saved mappings.
-        // Select2 does not reliably read the HTML `selected` attribute when
-        // allowClear/placeholder are active, so we set the value explicitly.
-        $('#mapping-tbody .rc-field-select').select2({
+        // Init Select2 on new rows
+        $tbody.find('.rc-field-select').select2({
             width:          '100%',
             placeholder:    '\u2014 Do not map \u2014',
             allowClear:     true,
-            dropdownParent: $('#sn-config-page')
+            dropdownParent: $('#catalog-item-modal')
         });
 
-        $('#mapping-tbody tr[data-sn-field]').each(function () {
+        // Restore saved mappings
+        $tbody.find('tr[data-sn-field]').each(function () {
             const snField    = $(this).data('sn-field');
-            const savedValue = SAVED_MAP[snField] || null;
+            const savedValue = savedMap[snField] || null;
             $(this).find('.rc-field-select').val(savedValue).trigger('change');
         });
     }
 
-    // ── Collect current mappings from table ───────────────────────────────
     function collectMappings() {
         const map = {};
-        $('#mapping-tbody tr[data-sn-field]').each(function () {
+        $('#modal-mapping-tbody tr[data-sn-field]').each(function () {
             const snField = $(this).data('sn-field');
             const rcField = $(this).find('.rc-field-select').val();
             map[snField] = rcField || '';
@@ -417,31 +814,292 @@ $(document).ready(function () {
         return map;
     }
 
-    // ── Validate that all required fields are mapped ───────────────────────
     function validateMappings() {
         const errors = [];
-        $('#mapping-tbody tr[data-required="true"]').each(function () {
+        $('#modal-mapping-tbody tr[data-required="true"]').each(function () {
             if ($(this).data('readonly') === true) return;
             const rcField = $(this).find('.rc-field-select').val();
-            if (!rcField) {
-                errors.push($(this).data('sn-field'));
-            }
+            if (!rcField) errors.push($(this).data('sn-field'));
         });
         return errors;
     }
 
-    // ── Test Connection ───────────────────────────────────────────────────
+    // Possible values modal (from mapping table rows)
+    $('#modal-mapping-tbody').on('click', '.btn-show-values', function () {
+        const field = $(this).closest('tr').data('sn-field-data');
+        if (field) showFieldValues(field);
+    });
+
+    // ── Load Fields ───────────────────────────────────────────────────────
+    function fetchModalFields() {
+        const creds = getCredentials();
+        const sysId = $('#modal-item-sys-id').val().trim();
+
+        if (!creds.instanceUrl || !creds.username || !creds.password) {
+            showAlert('warning', 'Please fill in all Connection Settings before loading fields.');
+            return;
+        }
+        if (!sysId) {
+            showAlert('warning', 'Please enter the catalog item sys_id.');
+            return;
+        }
+
+        const $btn = $('#btn-modal-fetch').prop('disabled', true)
+                                         .html('<i class="fas fa-spinner fa-spin mr-1"></i> Loading…');
+        $('#modal-mapping-table-section').hide();
+        $('#modal-mapping-count').hide();
+
+        module.ajax('getServiceNowFields', {
+            instanceUrl: creds.instanceUrl,
+            username:    creds.username,
+            password:    creds.password,
+            sysId:       sysId
+        }).then(function (resp) {
+            const fields = resp && resp.data;
+            if (resp.success && Array.isArray(fields)) {
+                if (fields.length === 0) {
+                    showAlert('warning',
+                        'No variables were returned for this catalog item. ' +
+                        'Verify the sys_id and confirm the item has variables configured.');
+                } else {
+                    modalCurrentSnapshot = {
+                        sys_id:     sysId,
+                        variables:  fields,
+                        fetched_at: new Date().toISOString()
+                    };
+                    // Keep existing mappings if same sys_id, else start fresh
+                    const existingSysId = pendingModalItem && pendingModalItem.sysId;
+                    const savedMap = (existingSysId === sysId && pendingModalItem.fieldMappings) ? pendingModalItem.fieldMappings : {};
+                    renderMappingTable(fields, savedMap);
+                }
+            } else {
+                showAlert('danger', 'Could not load fields: ' + escHtml((resp && resp.error) || 'Unknown error.'));
+            }
+        }).catch(function () {
+            showAlert('danger', 'Request failed. Check your connection settings and try again.');
+        }).finally(function () {
+            $btn.prop('disabled', false).html('<i class="fas fa-sync-alt mr-1"></i> Load Fields');
+        });
+    }
+
+    $('#btn-modal-fetch').on('click', fetchModalFields);
+    $('#btn-modal-reload').on('click', fetchModalFields);
+
+    // ── Criteria Builder (modal) ──────────────────────────────────────────
+    function buildCriterionRow(criterion) {
+        criterion = criterion || {};
+        const field    = criterion.field    || '';
+        const operator = criterion.operator || 'eq';
+        const value    = criterion.value    || '';
+
+        let opOpts = '';
+        CRITERION_OPERATORS.forEach(function (op) {
+            const sel = op.value === operator ? ' selected' : '';
+            opOpts += '<option value="' + op.value + '"' + sel + '>' + op.label + '</option>';
+        });
+
+        const hideValue = operator === 'not_empty' || operator === 'empty';
+
+        return '<div class="d-flex align-items-center mb-2 criterion-row">' +
+            '<div class="criterion-field-wrap mr-2" style="flex:0 1 280px;min-width:160px">' +
+            '<select class="form-control form-control-sm criterion-field">' + buildFormGroupedOptions(field) + '</select>' +
+            '</div>' +
+            '<select class="form-control form-control-sm mr-2 criterion-operator" style="max-width:175px">' + opOpts + '</select>' +
+            buildValueInput(field, value, hideValue) +
+            '<button class="btn btn-sm btn-outline-danger btn-remove-criterion flex-shrink-0 ml-2" type="button" title="Remove">' +
+            '<i class="fas fa-times"></i></button></div>';
+    }
+
+    function renderModalCriteria(criteria) {
+        const $container = $('#modal-criteria-container').empty();
+        if (!criteria || criteria.length === 0) {
+            $('#modal-criteria-empty').show();
+            return;
+        }
+        $('#modal-criteria-empty').hide();
+
+        const savedFields = [];
+        criteria.forEach(function (c) {
+            savedFields.push(c.field || '');
+            $container.append(buildCriterionRow(c));
+        });
+
+        // Init Select2 on criterion field selects
+        $container.find('.criterion-field').select2({
+            width:          '100%',
+            placeholder:    '— Select field —',
+            allowClear:     true,
+            dropdownParent: $('#catalog-item-modal')
+        });
+
+        // Restore selected values (Select2 needs explicit .val().trigger('change'))
+        $container.find('.criterion-row').each(function (i) {
+            const val = savedFields[i];
+            if (val) {
+                $(this).find('.criterion-field').val(val).trigger('change');
+            }
+        });
+    }
+
+    function collectModalCriteria() {
+        const criteria = [];
+        $('#modal-criteria-container .criterion-row').each(function () {
+            const field    = $(this).find('.criterion-field').val();
+            const operator = $(this).find('.criterion-operator').val();
+            const value    = $(this).find('.criterion-value').val();
+            if (field) {
+                criteria.push({ field: field, operator: operator || 'eq', value: value || '' });
+            }
+        });
+        return criteria;
+    }
+
+    $('#btn-modal-add-criterion').on('click', function () {
+        $('#modal-criteria-empty').hide();
+        const $row = $(buildCriterionRow({}));
+        $('#modal-criteria-container').append($row);
+        $row.find('.criterion-field').select2({
+            width:          '100%',
+            placeholder:    '— Select field —',
+            allowClear:     true,
+            dropdownParent: $('#catalog-item-modal')
+        });
+    });
+
+    $('#modal-criteria-container').on('click', '.btn-remove-criterion', function () {
+        $(this).closest('.criterion-row').remove();
+        if ($('#modal-criteria-container .criterion-row').length === 0) {
+            $('#modal-criteria-empty').show();
+        }
+    });
+
+    $('#modal-criteria-container').on('change', '.criterion-operator', function () {
+        const noValue = $(this).val() === 'not_empty' || $(this).val() === 'empty';
+        $(this).closest('.criterion-row').find('.criterion-value').toggle(!noValue);
+    });
+
+    $('#modal-criteria-container').on('select2:select select2:clear', '.criterion-field', function () {
+        const $row      = $(this).closest('.criterion-row');
+        const fieldName = $(this).val() || '';
+        const operator  = $row.find('.criterion-operator').val();
+        const hideValue = operator === 'not_empty' || operator === 'empty';
+        $row.find('.criterion-value').replaceWith($(buildValueInput(fieldName, '', hideValue)));
+    });
+
+    // ── Save Catalog Item ─────────────────────────────────────────────────
+    $('#btn-modal-save').on('click', function () {
+        const label       = $('#modal-item-label').val().trim();
+        const active      = $('#modal-item-active').is(':checked');
+        const sysId       = $('#modal-item-sys-id').val().trim();
+        const triggerForm = $('#modal-trigger-form-select').val() || '';
+
+        if (!label) {
+            showAlert('warning', 'Please enter a label for this catalog item.');
+            return;
+        }
+        if (!sysId) {
+            showAlert('warning', 'Please enter the catalog item sys_id.');
+            return;
+        }
+
+        // Validate required mappings (only if mapping table is shown)
+        if ($('#modal-mapping-table-section').is(':visible')) {
+            const errors = validateMappings();
+            if (errors.length > 0) {
+                showAlert('warning',
+                    'The following required ServiceNow variables are not mapped: ' +
+                    '<strong>' + errors.map(escHtml).join(', ') + '</strong>.');
+                return;
+            }
+        }
+
+        const fieldMappings = collectMappings();
+        const criteria      = collectModalCriteria();
+        const itemIndex     = pendingModalItem ? pendingModalItem.index : null;
+
+        const $btn = $(this).prop('disabled', true)
+                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Saving…');
+
+        module.ajax('saveCatalogItem', {
+            index:         itemIndex,
+            label:         label,
+            active:        active,
+            sysId:         sysId,
+            fieldMappings: fieldMappings,
+            triggerForm:   triggerForm,
+            criteria:      criteria,
+            snapshot:      modalCurrentSnapshot
+        }).then(function (resp) {
+            if (resp.success) {
+                const newItem = {
+                    label:         label,
+                    active:        active,
+                    sysId:         sysId,
+                    fieldMappings: fieldMappings,
+                    triggerForm:   triggerForm,
+                    criteria:      criteria,
+                    snapshot:      modalCurrentSnapshot
+                };
+                CATALOG_ITEMS[resp.index] = newItem;
+                renderCatalogItemsTable();
+                catalogItemModal.hide();
+                showAlert('success', 'Catalog item saved successfully.', true);
+            } else {
+                showAlert('danger', 'Save failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
+            }
+        }).catch(function () {
+            showAlert('danger', 'Save request failed. Please try again.');
+        }).finally(function () {
+            $btn.prop('disabled', false).html('<i class="fas fa-save mr-1"></i> Save Catalog Item');
+        });
+    });
+
+    // ── Delete Catalog Item ───────────────────────────────────────────────
+    $('#catalog-items-tbody').on('click', '.btn-delete-item', function () {
+        pendingDeleteIndex = parseInt($(this).data('index'), 10);
+        const label = $(this).data('label') || 'this catalog item';
+        $('#confirm-delete-label').text(label);
+        deleteConfirmModal.show();
+    });
+
+    $('#btn-confirm-delete').on('click', function () {
+        if (pendingDeleteIndex === null) return;
+        const idx  = pendingDeleteIndex;
+        const $btn = $(this).prop('disabled', true)
+                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Deleting…');
+
+        module.ajax('deleteCatalogItem', { index: idx }).then(function (resp) {
+            if (resp.success) {
+                CATALOG_ITEMS.splice(idx, 1);
+                renderCatalogItemsTable();
+                deleteConfirmModal.hide();
+                showAlert('success', 'Catalog item deleted.', true);
+            } else {
+                showAlert('danger', 'Delete failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
+            }
+        }).catch(function () {
+            showAlert('danger', 'Delete request failed. Please try again.');
+        }).finally(function () {
+            $btn.prop('disabled', false).html('<i class="fas fa-trash mr-1"></i> Delete');
+            pendingDeleteIndex = null;
+        });
+    });
+
+    $('#delete-confirm-modal').on('hidden.bs.modal', function () {
+        pendingDeleteIndex = null;
+    });
+
+    // ── Connection Settings ───────────────────────────────────────────────
     $('#btn-test').on('click', function () {
         const creds = getCredentials();
-        console.log('Testing connection with credentials:', creds);
         if (!creds.instanceUrl || !creds.username || !creds.password) {
             showAlert('warning', 'Please fill in the Instance URL, username, and password before testing.');
             return;
         }
         const $btn = $(this).prop('disabled', true)
-                          .html('<i class="fas fa-spinner fa-spin mr-1"></i> Testing…');
+                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Testing…');
         $('#test-status').html('');
-    
+
         module.ajax('testConnection', {
             instanceUrl: creds.instanceUrl,
             username:    creds.username,
@@ -455,7 +1113,7 @@ $(document).ready(function () {
             } else {
                 $('#test-status').html(
                     '<span class="text-danger"><i class="fas fa-times-circle mr-1"></i>' +
-                    escHtml(resp.error || 'Connection failed') + '</span>'
+                    escHtml((resp && resp.error) || 'Connection failed') + '</span>'
                 );
                 $('#btn-save-connection').prop('disabled', true);
             }
@@ -465,12 +1123,10 @@ $(document).ready(function () {
             );
             $('#btn-save-connection').prop('disabled', true);
         }).finally(function () {
-            $btn.prop('disabled', false)
-                .html('<i class="fas fa-satellite-dish mr-1"></i> Test Connection');
+            $btn.prop('disabled', false).html('<i class="fas fa-satellite-dish mr-1"></i> Test Connection');
         });
     });
 
-    // ── Save Connection Settings ──────────────────────────────────────────
     $('#btn-save-connection').on('click', function () {
         const creds = getCredentials();
         const $btn  = $(this).prop('disabled', true)
@@ -488,101 +1144,12 @@ $(document).ready(function () {
                     $('#sn-password').val('').attr('placeholder', 'Saved — enter to change');
                 }
             } else {
-                showAlert('danger', 'Save failed: ' + escHtml(resp.error || 'Unknown error.'));
+                showAlert('danger', 'Save failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
             }
         }).catch(function () {
             showAlert('danger', 'Save request failed. Please try again.');
         }).finally(function () {
-            $btn.prop('disabled', false)
-                .html('<i class="fas fa-save mr-1"></i> Save Connection Settings');
-        });
-    });
-
-    // ── Fetch ServiceNow Fields ───────────────────────────────────────────
-    function fetchFields() {
-        const creds = getCredentials();
-        const sysId = $('#catalog-sys-id').val().trim();
-
-        if (!creds.instanceUrl || !creds.username || !creds.password) {
-            showAlert('warning', 'Please fill in all Connection Settings before loading fields.');
-            return;
-        }
-        if (!sysId) {
-            showAlert('warning', 'Please enter the catalog item sys_id.');
-            return;
-        }
-
-        const $btn = $('#btn-fetch').prop('disabled', true)
-                                  .html('<i class="fas fa-spinner fa-spin mr-1"></i> Loading…');
-        $('#mapping-card').hide();
-        $('#btn-save').prop('disabled', true);
-        $('#alert-area').empty();
-
-        module.ajax('getServiceNowFields', {
-            instanceUrl: creds.instanceUrl,
-            username:    creds.username,
-            password:    creds.password,
-            sysId:       sysId
-        }).then(function (resp) {
-            console.log('getServiceNowFields response:', resp);
-            const fields = resp?.data?.result;
-            if (resp.success && Array.isArray(fields)) {
-                if (fields.length === 0) {
-                    showAlert('warning',
-                        'No variables were returned for this catalog item. ' +
-                        'Verify the sys_id and confirm the item has variables configured.');
-                } else {
-                    renderMappingTable(fields);
-                }
-            } else {
-                showAlert('danger', 'Could not load fields: ' + escHtml(resp.error || 'Unknown error.'));
-            }
-        }).catch(function (error) {
-            console.log('getServiceNowFields request failed:', error);
-            showAlert('danger', 'Request failed. Check your connection settings and try again.');
-        }).finally(function () {
-            $btn.prop('disabled', false)
-                .html('<i class="fas fa-sync-alt mr-1"></i> Load Fields');
-        });
-    }
-
-    $('#btn-fetch').on('click', fetchFields);
-    $('#btn-reload').on('click', fetchFields);
-
-    // ── Save Configuration ────────────────────────────────────────────────
-    $('#btn-save').on('click', function () {
-        const errors = validateMappings();
-        if (errors.length > 0) {
-            showAlert('warning',
-                'The following required ServiceNow variables are not mapped to a REDCap field: ' +
-                '<strong>' + errors.map(escHtml).join(', ') + '</strong>. ' +
-                'Please map all required variables before saving.');
-            return;
-        }
-        const mappings = collectMappings();
-        const $btn = $(this).prop('disabled', true)
-                          .html('<i class="fas fa-spinner fa-spin mr-1"></i> Saving…');
-
-        module.ajax('saveConfiguration', {
-            sysId:         $('#catalog-sys-id').val().trim(),
-            fieldMappings: mappings
-        }).then(function (resp) {
-            if (resp.success) {
-                showAlert('success', 'Configuration saved successfully.', true);
-                // Clear password field; a new value is now saved
-                if ($('#sn-password').val() !== '') {
-                    HAS_PASSWORD = true;
-                    $('#sn-password').val('').attr('placeholder', 'Saved — enter to change');
-                    $('#sn-password').siblings('small').text('A password is saved. Leave blank to keep it.');
-                }
-            } else {
-                showAlert('danger', 'Save failed: ' + escHtml(resp.error || 'Unknown error.'));
-            }
-        }).catch(function () {
-            showAlert('danger', 'Save request failed. Please try again.');
-        }).finally(function () {
-            $btn.prop('disabled', false)
-                .html('<i class="fas fa-save mr-1"></i> Save Configuration');
+            $btn.prop('disabled', false).html('<i class="fas fa-save mr-1"></i> Save Connection Settings');
         });
     });
 
@@ -594,9 +1161,5 @@ $(document).ready(function () {
         $('#pw-eye-icon').toggleClass('fa-eye fa-eye-slash');
     });
 
-    // ── Populate mapping table from snapshot on page load ─────────────────
-    if (SNAPSHOT && Array.isArray(SNAPSHOT.variables) && SNAPSHOT.variables.length > 0) {
-        renderMappingTable(SNAPSHOT.variables);
-    }
 });
 </script>

@@ -5,6 +5,8 @@ namespace YaleREDCap\REDCapServiceNowCatalogIntegration;
 use ExternalModules\AbstractExternalModule;
 use ExternalModules\Framework;
 
+require_once __DIR__ . '/classes/ServiceNowApiClient.php';
+
 /**
  * @property Framework $framework
  * @see Framework
@@ -12,178 +14,386 @@ use ExternalModules\Framework;
 class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 {
 
+    /** Set to true to write verbose debug entries to the EM log. */
+    private const DEBUG = true;
+
+    /**
+     * This function is called via a cron job. It is meant to check for changes in the ServiceNow catalog items that
+     * have been configured in REDCap. If changes are detected, it should alert the appropriate users.
+     */
     public function checkCatalogChanges()
     {
-    
+
+    }
+
+    public function redcap_save_record( $project_id, $record, $instrument, $event_id, $group_id = NULL, $survey_hash = NULL, $response_id = NULL, $repeat_instance = 1 ) {
+        $this->debug('redcap_save_record fired', [
+            'project_id'      => $project_id,
+            'record'          => $record,
+            'instrument'      => $instrument,
+            'event_id'        => $event_id,
+            'repeat_instance' => $repeat_instance,
+        ]);
+
+        $items = $this->getCatalogItems();
+        if (empty($items)) {
+            $this->debug('No catalog items configured — exiting');
+            return;
+        }
+
+        $this->debug('Catalog items loaded', ['count' => count($items)]);
+
+        $rawDataFetched = false;
+        $recordData     = [];
+
+        foreach ($items as $idx => $item) {
+            $itemLabel = $item['label'] ?? "(item $idx)";
+
+            // Skip inactive items
+            if (!($item['active'] ?? false)) {
+                $this->debug("[$itemLabel] Skipping — item is inactive");
+                continue;
+            }
+
+            // Only fire when the configured trigger form is saved
+            $triggerForm = (string) ($item['triggerForm'] ?? '');
+            if ($triggerForm === '') {
+                $this->debug("[$itemLabel] Skipping — no trigger form configured");
+                continue;
+            }
+            if ($triggerForm !== $instrument) {
+                $this->debug("[$itemLabel] Skipping — trigger form '$triggerForm' does not match saved instrument '$instrument'");
+                continue;
+            }
+
+            // Require a configured catalog item and field mappings
+            $catalogSysId  = (string) ($item['sysId'] ?? '');
+            $fieldMappings = $item['fieldMappings'] ?? [];
+            if ($catalogSysId === '') {
+                $this->debug("[$itemLabel] Skipping — no catalog sys_id configured");
+                continue;
+            }
+            if (empty($fieldMappings)) {
+                $this->debug("[$itemLabel] Skipping — no field mappings configured");
+                continue;
+            }
+
+            $this->debug("[$itemLabel] Trigger form matches — loading record data");
+
+            // Lazy-load record data on first match
+            if (!$rawDataFetched) {
+                $rawData = \REDCap::getData([
+                    'project_id'    => $project_id,
+                    'return_format' => 'array',
+                    'records'       => [$record],
+                    'events'        => [$event_id],
+                ]);
+
+                $recordData = $rawData[$record][$event_id] ?? [];
+                if (isset($rawData[$record]['repeat_instances'][$event_id][$instrument][$repeat_instance])) {
+                    $recordData = array_merge(
+                        $recordData,
+                        $rawData[$record]['repeat_instances'][$event_id][$instrument][$repeat_instance]
+                    );
+                }
+                $rawDataFetched = true;
+                $this->debug('Record data fetched', ['field_count' => count($recordData)]);
+            }
+
+            // Evaluate trigger criteria — all conditions must pass (AND logic)
+            $criteria = $item['criteria'] ?? [];
+            $this->debug("[$itemLabel] Evaluating criteria", ['criteria_count' => count($criteria)]);
+            if (!$this->meetsCriteria((array) $criteria, $recordData)) {
+                $this->debug("[$itemLabel] Criteria not met — skipping");
+                continue;
+            }
+            $this->debug("[$itemLabel] Criteria met — building RITM payload");
+
+            // Build the RITM variable map from saved field mappings
+            $ritmVariables = [];
+            foreach ((array) $fieldMappings as $snVariable => $rcField) {
+                if ($rcField !== '' && array_key_exists($rcField, $recordData)) {
+                    $ritmVariables[$snVariable] = (string) $recordData[$rcField];
+                }
+            }
+            $this->debug("[$itemLabel] RITM payload built", [
+                'sys_id'          => $catalogSysId,
+                'variable_count'  => count($ritmVariables),
+                'variables'       => $ritmVariables,
+            ]);
+
+            // Submit the RITM and log the outcome
+            $result = $this->getApiClient()->submitRitm($catalogSysId, $ritmVariables);
+            $this->debug("[$itemLabel] RITM submission response", [
+                'success'     => $result['success'],
+                'http_code'   => $result['httpCode']               ?? null,
+                'ritm_number' => $result['data']['request_number'] ?? null,
+                'error'       => $result['error']                  ?? null,
+            ]);
+
+            $this->framework->log(
+                'ServiceNow RITM submission ' . ($result['success'] ? 'succeeded' : 'failed'),
+                [
+                    'record'        => $record,
+                    'event_id'      => $event_id,
+                    'instrument'    => $instrument,
+                    'instance'      => $repeat_instance,
+                    'catalog_label' => $item['label'] ?? '',
+                    'http_code'     => $result['httpCode']               ?? null,
+                    'ritm_number'   => $result['data']['request_number'] ?? null,
+                    'error'         => $result['error']                  ?? null,
+                ]
+            );
+        }
+
+        $this->debug('redcap_save_record complete');
     }
 
     public function redcap_module_ajax($action, $payload, $project_id, $record, $instrument, $event_id, $repeat_instance, $survey_hash, $response_id, $survey_queue_hash, $page, $page_full, $user_id, $group_id)  {
-        if ($action === 'testConnection') {
-            return $this->testConnection($payload);
-        } else if ($action === 'saveConnectionSettings') {
-            return $this->saveConnectionSettings($payload);
-        } else if ($action === 'getServiceNowFields') {
-            $catalogItemId = $payload['sysId'] ?? '';
-            if (empty($catalogItemId)) {
-                return ['success' => false, 'error' => 'Missing required parameter: sysId.'];
-            }
-
-            return $this->getServiceNowFields($catalogItemId);
-        } else if ($action === 'saveConfiguration') {
-            return $this->saveConfiguration($payload);
+        switch ($action) {
+            case 'testConnection':
+                return $this->testConnection($payload);
+            case 'saveConnectionSettings':
+                return $this->saveConnectionSettings($payload);
+            case 'getServiceNowFields':
+                $catalogItemId = $payload['sysId'] ?? '';
+                if (empty($catalogItemId)) {
+                    return ['success' => false, 'error' => 'Missing required parameter: sysId.'];
+                }
+                return $this->getServiceNowFields($catalogItemId);
+            case 'saveCatalogItem':
+                return $this->saveCatalogItem($payload);
+            case 'deleteCatalogItem':
+                return $this->deleteCatalogItem($payload);
+            default:
+                return ['success' => false, 'error' => 'Unknown action.'];
         }
+    }
+
+    /**
+     * Returns all configured catalog items as an array of associative arrays.
+     * Each element has: label, active, sysId, fieldMappings, snapshot, triggerForm, criteria.
+     */
+    public function getCatalogItems(): array
+    {
+        $labels    = (array) ($this->framework->getProjectSetting('catalog-item-label')            ?? []);
+        $actives   = (array) ($this->framework->getProjectSetting('catalog-item-active')           ?? []);
+        $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
+        $mappings  = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
+        $snapshots = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
+        $forms     = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
+        $criteria  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
+
+        $count = count($labels);
+        $items = [];
+        for ($i = 0; $i < $count; $i++) {
+            $items[] = [
+                'label'         => (string) ($labels[$i] ?? ''),
+                'active'        => ($actives[$i] ?? '') === '1',
+                'sysId'         => (string) ($sysIds[$i] ?? ''),
+                'fieldMappings' => json_decode($mappings[$i]  ?? '{}',   true) ?? [],
+                'snapshot'      => json_decode($snapshots[$i] ?? 'null', true),
+                'triggerForm'   => (string) ($forms[$i] ?? ''),
+                'criteria'      => json_decode($criteria[$i]  ?? '[]',   true) ?? [],
+            ];
+        }
+        return $items;
+    }
+
+    private function saveCatalogItem(array $payload): array
+    {
+        $index         = (isset($payload['index']) && $payload['index'] !== null && $payload['index'] !== '')
+                         ? (int) $payload['index'] : null;
+        $label         = trim($payload['label']       ?? '');
+        $active        = !empty($payload['active']);
+        $sysId         = trim($payload['sysId']       ?? '');
+        $fieldMappings = $payload['fieldMappings']    ?? [];
+        $triggerForm   = $payload['triggerForm']      ?? '';
+        $criteria      = $payload['criteria']         ?? [];
+        $snapshot      = $payload['snapshot']         ?? null;
+
+        if ($label === '') {
+            return ['success' => false, 'error' => 'Label is required.'];
+        }
+        if ($sysId === '') {
+            return ['success' => false, 'error' => 'Catalog Item sys_id is required.'];
+        }
+
+        // Read existing parallel arrays
+        $labels    = (array) ($this->framework->getProjectSetting('catalog-item-label')            ?? []);
+        $actives   = (array) ($this->framework->getProjectSetting('catalog-item-active')           ?? []);
+        $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
+        $mapsArr   = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
+        $snapsArr  = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
+        $formsArr  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
+        $critArr   = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
+
+        // Append for new items
+        if ($index === null) {
+            $index = count($labels);
+        }
+
+        $labels[$index]   = $label;
+        $actives[$index]  = $active ? '1' : '0';
+        $sysIds[$index]   = $sysId;
+        $mapsArr[$index]  = json_encode(is_array($fieldMappings) ? $fieldMappings : []);
+        $snapsArr[$index] = $snapshot !== null ? json_encode($snapshot) : null;
+        $formsArr[$index] = $triggerForm;
+        $critArr[$index]  = json_encode(is_array($criteria) ? $criteria : []);
+
+        $this->framework->setProjectSetting('catalog-item-label',             $labels);
+        $this->framework->setProjectSetting('catalog-item-active',            $actives);
+        $this->framework->setProjectSetting('catalog-item-sys-id',            $sysIds);
+        $this->framework->setProjectSetting('catalog-item-field-mappings',    $mapsArr);
+        $this->framework->setProjectSetting('catalog-item-snapshot',          $snapsArr);
+        $this->framework->setProjectSetting('catalog-item-trigger-form',      $formsArr);
+        $this->framework->setProjectSetting('catalog-item-trigger-criteria',  $critArr);
+
+        return ['success' => true, 'index' => $index];
+    }
+
+    private function deleteCatalogItem(array $payload): array
+    {
+        $index = isset($payload['index']) ? (int) $payload['index'] : -1;
+        if ($index < 0) {
+            return ['success' => false, 'error' => 'Invalid index.'];
+        }
+
+        $keys = [
+            'catalog-item-label',
+            'catalog-item-active',
+            'catalog-item-sys-id',
+            'catalog-item-field-mappings',
+            'catalog-item-snapshot',
+            'catalog-item-trigger-form',
+            'catalog-item-trigger-criteria',
+        ];
+
+        foreach ($keys as $key) {
+            $values = (array) ($this->framework->getProjectSetting($key) ?? []);
+            array_splice($values, $index, 1);
+            $this->framework->setProjectSetting($key, array_values($values));
+        }
+
+        return ['success' => true];
     }
 
     private function saveConnectionSettings(array $payload)
     {
         $instanceUrl = $payload['instanceUrl'] ?? '';
-        $username = $payload['username'] ?? '';
-        $password = $payload['password'] ?? '';
+        $username    = $payload['username']    ?? '';
+        $password    = $payload['password']    ?? '';
         if (empty($instanceUrl) || empty($username) || empty($password)) {
             return ['success' => false, 'message' => 'Missing required parameters.'];
         }
         $this->framework->setProjectSetting('servicenow-instance-url', $instanceUrl);
-        $this->framework->setProjectSetting('servicenow-username', $username);
-        $this->framework->setProjectSetting('servicenow-password', $password);
+        $this->framework->setProjectSetting('servicenow-username',      $username);
+        $this->framework->setProjectSetting('servicenow-password',      $password);
         return ['success' => true, 'message' => 'Connection settings saved successfully.'];
     }
 
-    private function saveConfiguration(array $payload)
+    private function testConnection(array $payload): array
     {
-        $sysId = $payload['sysId'] ?? '';
-        $fieldMappings = $payload['fieldMappings'] ?? [];
+        $instanceUrl = trim($payload['instanceUrl'] ?? '');
+        $username    = trim($payload['username']    ?? '');
+        $password    =      $payload['password']    ?? '';
 
-        if (empty($sysId)) {
-            return ['success' => false, 'message' => 'Missing required parameter: sysId.'];
-        }
-        if (empty($fieldMappings) || !is_array($fieldMappings)) {
-            return ['success' => false, 'message' => 'Missing or invalid required parameter: fieldMappings.'];
+        if ($instanceUrl === '' || $username === '' || $password === '') {
+            return ['success' => false, 'error' => 'Missing required parameters.'];
         }
 
-        $this->framework->setProjectSetting('servicenow-catalog-sys-id', $sysId);
-        $this->framework->setProjectSetting('field-mappings', $fieldMappings);
-        return ['success' => true, 'message' => 'Configuration saved successfully.'];
-    }
-
-    private function testConnection($payload)
-    {
-        $instanceUrl = $payload['instanceUrl'] ?? '';
-        $username = $payload['username'] ?? '';
-        $password = $payload['password'] ?? '';
-
-        if (empty($instanceUrl) || empty($username) || empty($password)) {
-            return ['success' => false, 'message' => 'Missing required parameters.'];
-        }
-
-        // If the provided password is a placeholder, retrieve the actual password from project settings
         if ($password === '__SAVED__') {
-            $password = $this->framework->getProjectSetting('servicenow-password');
-            $this->framework->log("Using saved password for ServiceNow connection test: $password");
+            $password = (string) ($this->framework->getProjectSetting('servicenow-password') ?? '');
         }
 
-        // Ensure the instance URL does not end with a slash
-        $instanceUrl = rtrim($instanceUrl, '/');
-
-        // Construct the ServiceNow API URL for testing
-        $testUrl = $instanceUrl . '/api/sn_sc/servicecatalog/catalogs';
-
-        // Initialize cURL
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $testUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CUSTOMREQUEST => 'GET',
-            CURLOPT_HTTPHEADER => array(
-                'Authorization: Basic ' . base64_encode("$username:$password"),
-            ),
-            // CURLOPT_USERPWD => "$username:$password",
-            // CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
-            CURLOPT_SSL_VERIFYPEER => false, // For testing purposes; consider enabling in production
-        ]);
-        // curl_setopt($ch, CURLOPT_URL, $testUrl);
-        // curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        // curl_setopt($ch, CURLOPT_USERPWD, "$username:$password");
-        // curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        // curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // For testing purposes; consider enabling in production
-
-        // Execute the request
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        $this->framework->log("ServiceNow connection test response: HTTP $httpCode, Response: $response");
-
-        $result = [];
-        if ($httpCode === 200) {
-            $result = ['success' => true, 'message' => 'Connection successful!'];
-        } else {
-            $result = ['success' => false, 'message' => 'Connection failed. HTTP Code: ' . $httpCode];
-        }
-        return $result;
+        return (new ServiceNowApiClient($instanceUrl, $username, $password))->testConnection();
     }
 
-    private function getServiceNowConnectionSettings()
+    private function getServiceNowFields(string $catalogItemId): array
     {
-        $instanceUrl = $this->framework->getProjectSetting('servicenow-instance-url');
-        $username = $this->framework->getProjectSetting('servicenow-username');
-        $password = $this->framework->getProjectSetting('servicenow-password');
-
-        return [
-            'instanceUrl' => $instanceUrl,
-            'username' => $username,
-            'password' => $password,
-        ];
-    }
-
-    private function getServiceNowFields($catalogItemId)
-    {
-        // Ensure the instance URL does not end with a slash
-        $settings = $this->getServiceNowConnectionSettings();
-        $instanceUrl = rtrim($settings['instanceUrl'], '/');
-        $username = $settings['username'];
-        $password = $settings['password'];
-
-        // Construct the ServiceNow API URL for fetching catalog item fields
-        $fieldsUrl = $instanceUrl . '/api/sn_sc/servicecatalog/items/' . urlencode($catalogItemId) . '/variables';
-
-        // Initialize cURL
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $fieldsUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CUSTOMREQUEST => 'GET',
-            CURLOPT_HTTPHEADER => array(
-                'Authorization: Basic ' . base64_encode("$username:$password"),
-            ),
-            CURLOPT_SSL_VERIFYPEER => false, // For testing purposes; consider enabling in production
-        ]);
-
-        // Execute the request
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($httpCode === 200) {
-            $data      = json_decode($response, true);
-            $variables = $data['result'] ?? [];
-            $this->saveSnapshot($catalogItemId, $variables);
-            return ['success' => true, 'data' => $data];
-        } else {
-            return ['success' => false, 'error' => 'Failed to fetch fields. HTTP Code: ' . $httpCode, 'responseJSON' => $response];
-        }
+        return $this->getApiClient()->getCatalogItemVariables($catalogItemId);
     }
 
     /**
-     * Persists the ServiceNow catalog item variables so the configuration
-     * page can populate the mapping table on subsequent loads without an
-     * additional API call.
+     * Creates a ServiceNowApiClient using the project's saved connection settings.
      */
-    private function saveSnapshot(string $catalogItemId, array $variables): void
+    private function getApiClient(): ServiceNowApiClient
     {
-        $this->framework->setProjectSetting('catalog-item-snapshot', [
-            'sys_id'     => $catalogItemId,
-            'variables'  => $variables,
-            'fetched_at' => date('Y-m-d H:i:s'),
-        ]);
+        return new ServiceNowApiClient(
+            (string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? ''),
+            (string) ($this->framework->getProjectSetting('servicenow-username')     ?? ''),
+            (string) ($this->framework->getProjectSetting('servicenow-password')     ?? '')
+        );
     }
+
+    /**
+     * Returns true when every criterion in $criteria is satisfied by $recordData.
+     * An empty criteria array is always satisfied (no conditions = always push).
+     *
+     * Supported operators: eq, neq, contains, not_empty, empty.
+     *
+     * @param array $criteria   Array of {field, operator, value} objects.
+     * @param array $recordData Flat field→value map for the current record/event.
+     */
+    /**
+     * Writes a log entry only when DEBUG is true.
+     *
+     * @param string $message
+     * @param array  $params  Optional key→value context pairs.
+     */
+    private function debug(string $message, array $params = []): void
+    {
+        if (!self::DEBUG) {
+            return;
+        }
+        // framework->log() only accepts scalar param values; encode arrays/objects.
+        $safe = [];
+        foreach ($params as $k => $v) {
+            $safe[$k] = is_array($v) || is_object($v) ? json_encode($v) : $v;
+        }
+        $this->framework->log('[DEBUG] ' . $message, $safe);
+    }
+
+    private function meetsCriteria(array $criteria, array $recordData): bool
+    {
+        foreach ($criteria as $criterion) {
+            $field    =          $criterion['field']    ?? '';
+            $operator = (string) ($criterion['operator'] ?? 'eq');
+            $expected = (string) ($criterion['value']    ?? '');
+
+            if ($field === '') {
+                continue;
+            }
+
+            $actual = (string) ($recordData[$field] ?? '');
+
+            switch ($operator) {
+                case 'eq':
+                    $passes = $actual === $expected;
+                    break;
+                case 'neq':
+                    $passes = $actual !== $expected;
+                    break;
+                case 'contains':
+                    $passes = $expected === '' || str_contains($actual, $expected);
+                    break;
+                case 'not_empty':
+                    $passes = $actual !== '';
+                    break;
+                case 'empty':
+                    $passes = $actual === '';
+                    break;
+                default:
+                    $passes = true;
+            }
+
+            if (!$passes) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+
 }

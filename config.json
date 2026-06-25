@@ -44,25 +44,62 @@
             "hidden": true
         },
         {
-            "key": "servicenow-catalog-sys-id",
-            "name": "ServiceNow Catalog Item sys_id",
-            "type": "text",
-            "required": false,
-            "hidden": true
-        },
-        {
-            "key": "field-mappings",
-            "name": "Field Mappings (JSON)",
-            "type": "json",
-            "required": false,
-            "hidden": true
-        },
-        {
-            "key": "catalog-item-snapshot",
-            "name": "Catalog Item Field Snapshot (JSON)",
-            "type": "json",
-            "required": false,
-            "hidden": true
+            "key": "catalog-items",
+            "name": "Catalog Items",
+            "type": "sub_settings",
+            "repeatable": true,
+            "hidden": true,
+            "sub_settings": [
+                {
+                    "key": "catalog-item-label",
+                    "name": "Label",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-active",
+                    "name": "Active",
+                    "type": "checkbox",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-sys-id",
+                    "name": "Catalog Item sys_id",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-field-mappings",
+                    "name": "Field Mappings (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-snapshot",
+                    "name": "Field Snapshot (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-trigger-form",
+                    "name": "Trigger Form",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
+                    "key": "catalog-item-trigger-criteria",
+                    "name": "Trigger Criteria (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                }
+            ]
         }
     ],
     "crons": [
@@ -76,14 +113,15 @@
     ],
     "enable-ajax-logging": true,
     "auth-ajax-actions": [
+        "deleteCatalogItem",
         "getServiceNowFields",
-        "saveConfiguration",
+        "saveCatalogItem",
         "saveConnectionSettings",
         "submitCatalogRequest",
         "testConnection"
     ],
     "compatibility": {
-        "php-version-min": "7.4.0",
+        "php-version-min": "8.0.0",
         "redcap-version-min": "13.0.0"
     }
 }
