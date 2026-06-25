@@ -39,6 +39,7 @@ foreach ($metaData as $fieldInfo) {
             break;
         case 'radio':
         case 'select':
+        case 'dropdown':
         case 'checkbox':
             foreach (explode('|', $fieldInfo['select_choices_or_calculations'] ?? '') as $part) {
                 $part = trim($part);
@@ -148,6 +149,33 @@ foreach ($redcapForms as $form) {
     #field-values-modal { z-index: 1210; }
     #field-values-modal .modal-dialog {
         max-width: 640px;
+    }
+    /* Value matching modal appears above the catalog item modal */
+    #value-match-modal { z-index: 1215; }
+    #value-match-modal .modal-dialog { max-width: 660px; }
+    #value-match-table thead th {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        background: #f8f9fa;
+        white-space: nowrap;
+    }
+    #value-match-table code {
+        font-size: 0.82em;
+        color: #6f42c1;
+        background: #f3f0ff;
+        padding: 2px 6px;
+        border-radius: 3px;
+    }
+    .btn-match-values { white-space: nowrap; }
+    .value-map-badge {
+        font-size: 0.7em;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 3px;
+        background: #e2f0d9;
+        color: #2e6b1f;
+        border: 1px solid #cfe6c0;
     }
     /* #field-values-modal .modal-content {
         border: 1px solid rgba(13, 42, 74, 0.18);
@@ -535,6 +563,27 @@ foreach ($redcapForms as $form) {
     </div>
 </div>
 
+<!-- ── Value Matching Modal ───────────────────────────────────────────────── -->
+<div class="modal fade" id="value-match-modal" tabindex="-1"
+     aria-labelledby="value-match-modal-title" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title" id="value-match-modal-title">Match Values</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="value-match-modal-body"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-success" id="btn-value-match-save">
+                    <i class="fas fa-check mr-1"></i> Apply
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div id="toast-container" aria-live="polite" aria-atomic="true"></div>
 
 <?= $module->initializeJavascriptModuleObject() ?>
@@ -586,6 +635,8 @@ $(document).ready(function () {
     const catalogItemModal  = new bootstrap.Modal(document.getElementById('catalog-item-modal'), { backdrop: 'static', keyboard: false });
     const deleteConfirmModal = new bootstrap.Modal(document.getElementById('delete-confirm-modal'));
     let fieldValuesModal    = null;
+    let valueMatchModal     = null;
+    let pendingValueMatchRow = null;
 
     const CRITERION_OPERATORS = [
         { value: 'eq',        label: 'equals' },
@@ -721,6 +772,140 @@ $(document).ready(function () {
         fieldValuesModal.show();
     }
 
+    // ── Value Matching (enum → enum) ──────────────────────────────────────
+    // Returns the list of selectable choices for a ServiceNow variable, or [].
+    function getSnChoices(field) {
+        if (!field) return [];
+        // Prefer the variable's real choices when the API supplies them (e.g.
+        // yes_no exposes Yes/No values, numeric_scale exposes its scale values).
+        // Fall back to the fixed value list only for choice-less types such as
+        // check_box (type 7), which submit a boolean true/false.
+        if (Array.isArray(field.choices) && field.choices.length > 0) {
+            return field.choices;
+        }
+        const typeKey = String(field.type || '');
+        if (Object.prototype.hasOwnProperty.call(FIXED_VALUE_TYPES, typeKey)) {
+            return FIXED_VALUE_TYPES[typeKey];
+        }
+        return [];
+    }
+
+    function snChoiceLabel(c) {
+        return String(c.label ?? c.text ?? c.display_value ?? c.value ?? '');
+    }
+
+    // A mapping row supports value matching only when BOTH the ServiceNow
+    // variable and the selected REDCap field expose a fixed set of choices.
+    function rowSupportsValueMatching($row) {
+        const field   = $row.data('sn-field-data');
+        const rcField = $row.find('.rc-field-select').val();
+        if (!field || !rcField) return false;
+        const snChoices = getSnChoices(field);
+        const rcChoices = RC_FIELD_CHOICES[rcField] || [];
+        return snChoices.length > 0 && rcChoices.length > 0;
+    }
+
+    // Refreshes the "Match values" control for a single mapping row.
+    function updateValueMapUi($row) {
+        const $wrap = $row.find('.value-map-wrap');
+        if (!rowSupportsValueMatching($row)) {
+            $wrap.hide().empty();
+            $row.removeData('value-map');
+            return;
+        }
+        const map    = $row.data('value-map') || {};
+        const mapped = Object.keys(map).filter(function (k) { return map[k] !== ''; }).length;
+        const badge  = mapped > 0
+            ? ' <span class="value-map-badge">' + mapped + ' matched</span>'
+            : '';
+        $wrap.html(
+            '<button type="button" class="btn btn-link btn-sm p-0 btn-match-values">' +
+            '<i class="fas fa-random mr-1"></i>Match values</button>' + badge
+        ).show();
+    }
+
+    function openValueMatchModal($row) {
+        const field     = $row.data('sn-field-data');
+        const rcField   = $row.find('.rc-field-select').val();
+        const snChoices = getSnChoices(field);
+        const rcChoices = RC_FIELD_CHOICES[rcField] || [];
+        const existing  = $row.data('value-map') || {};
+        const rcLabel   = (RC_FIELDS.find(function (f) { return f.name === rcField; }) || {}).label || rcField;
+        const snName    = getServiceNowFieldName(field);
+
+        let snOpts = '<option value="">— Do not send —</option>';
+        snChoices.forEach(function (c) {
+            const val = String(c.value ?? '');
+            snOpts += '<option value="' + escHtml(val) + '">' +
+                      escHtml(snChoiceLabel(c)) + ' [' + escHtml(val) + ']</option>';
+        });
+
+        let body =
+            '<p class="text-muted small mb-3">Choose which ServiceNow value to submit for each ' +
+            'REDCap value of <strong>' + escHtml(rcLabel) + '</strong> → <code>' + escHtml(snName) + '</code>.</p>' +
+            '<table class="table table-sm table-hover align-middle mb-0" id="value-match-table">' +
+            '<thead><tr><th>REDCap Value</th><th style="width:55%">ServiceNow Value</th></tr></thead><tbody>';
+
+        rcChoices.forEach(function (c) {
+            const rcVal = String(c.value ?? '');
+            body +=
+                '<tr data-rc-value="' + escHtml(rcVal) + '">' +
+                '<td><div>' + escHtml(String(c.label ?? '')) + '</div>' +
+                '<small class="text-muted"><code>' + escHtml(rcVal) + '</code></small></td>' +
+                '<td><select class="form-select form-select-sm value-match-select">' + snOpts + '</select></td>' +
+                '</tr>';
+        });
+        body += '</tbody></table>';
+
+        document.getElementById('value-match-modal-title').textContent = 'Match Values — ' + snName;
+        document.getElementById('value-match-modal-body').innerHTML    = body;
+
+        // Restore existing selections
+        $('#value-match-modal-body tr[data-rc-value]').each(function () {
+            const rcVal = String($(this).data('rc-value'));
+            if (Object.prototype.hasOwnProperty.call(existing, rcVal)) {
+                $(this).find('.value-match-select').val(existing[rcVal]);
+            }
+        });
+
+        pendingValueMatchRow = $row;
+        if (!valueMatchModal) {
+            valueMatchModal = new bootstrap.Modal(document.getElementById('value-match-modal'),
+                                                  { backdrop: 'static', keyboard: false });
+        }
+        valueMatchModal.show();
+    }
+
+    function applyValueMatch() {
+        if (!pendingValueMatchRow) return;
+        const map = {};
+        $('#value-match-modal-body tr[data-rc-value]').each(function () {
+            const rcVal = String($(this).data('rc-value'));
+            const snVal = $(this).find('.value-match-select').val();
+            if (snVal) map[rcVal] = snVal;
+        });
+        pendingValueMatchRow.data('value-map', map);
+        updateValueMapUi(pendingValueMatchRow);
+        if (valueMatchModal) valueMatchModal.hide();
+        pendingValueMatchRow = null;
+    }
+
+    $('#btn-value-match-save').on('click', applyValueMatch);
+
+    $('#modal-mapping-tbody').on('click', '.btn-match-values', function () {
+        openValueMatchModal($(this).closest('tr'));
+    });
+
+    // When the REDCap field selection changes, the prior value matches no longer
+    // apply, so reset them and refresh the value-matching control. Select2 does
+    // not reliably bubble a delegated `change` event on manual selection here, so
+    // listen for the Select2-specific events (mirrors the criteria builder).
+    $('#modal-mapping-tbody').on('select2:select select2:clear', '.rc-field-select', function () {
+        const $row = $(this).closest('tr');
+        $row.removeData('value-map');
+        updateValueMapUi($row);
+    });
+
     // ── Catalog Items Table ───────────────────────────────────────────────
     function renderCatalogItemsTable() {
         const $tbody = $('#catalog-items-tbody').empty();
@@ -822,7 +1007,7 @@ $(document).ready(function () {
         // Mapping table from snapshot
         if (item && item.snapshot && Array.isArray(item.snapshot.variables) && item.snapshot.variables.length > 0) {
             modalCurrentSnapshot = item.snapshot;
-            renderMappingTable(item.snapshot.variables, item.fieldMappings || {});
+            renderMappingTable(item.snapshot.variables, item.fieldMappings || {}, item.valueMappings || {});
         }
     });
 
@@ -871,8 +1056,9 @@ $(document).ready(function () {
         return flat;
     }
 
-    function renderMappingTable(fields, savedMap) {
+    function renderMappingTable(fields, savedMap, savedValueMap) {
         savedMap = savedMap || {};
+        savedValueMap = savedValueMap || {};
         const normalizedFields = flattenServiceNowFields(fields);
         const $tbody = $('#modal-mapping-tbody').empty();
         let rowCount = 0;
@@ -908,7 +1094,8 @@ $(document).ready(function () {
                 '<td>' + labelCell + '</td>' +
                 '<td><small class="text-muted">' + escHtml(type) + '</small></td>' +
                 '<td>' + attrsCell + '</td>' +
-                '<td>' + buildRcDropdown(savedRcField) + '</td>' +
+                '<td>' + buildRcDropdown(savedRcField) +
+                    '<div class="value-map-wrap mt-1" style="display:none"></div></td>' +
                 '</tr>'
             );
             $tr.data('sn-field-data', field);
@@ -934,9 +1121,16 @@ $(document).ready(function () {
 
         // Restore saved mappings
         $tbody.find('tr[data-sn-field]').each(function () {
-            const snField    = $(this).data('sn-field');
+            const $row       = $(this);
+            const snField    = $row.data('sn-field');
             const savedValue = savedMap[snField] || null;
-            $(this).find('.rc-field-select').val(savedValue).trigger('change');
+            $row.find('.rc-field-select').val(savedValue).trigger('change');
+            // Apply saved value matches after the field selection (the change
+            // handler above clears value-map, so restore it here).
+            if (savedValueMap[snField] && typeof savedValueMap[snField] === 'object') {
+                $row.data('value-map', savedValueMap[snField]);
+            }
+            updateValueMapUi($row);
         });
     }
 
@@ -946,6 +1140,27 @@ $(document).ready(function () {
             const snField = $(this).data('sn-field');
             const rcField = $(this).find('.rc-field-select').val();
             map[snField] = rcField || '';
+        });
+        return map;
+    }
+
+    function collectValueMappings() {
+        const map = {};
+        $('#modal-mapping-tbody tr[data-sn-field]').each(function () {
+            const $row    = $(this);
+            const rcField = $row.find('.rc-field-select').val();
+            const vmap    = $row.data('value-map');
+            // Only persist value matches for rows that are mapped and still
+            // support enum-to-enum matching.
+            if (rcField && vmap && rowSupportsValueMatching($row)) {
+                const kept = {};
+                Object.keys(vmap).forEach(function (k) {
+                    if (vmap[k] !== '') kept[k] = vmap[k];
+                });
+                if (Object.keys(kept).length > 0) {
+                    map[$row.data('sn-field')] = kept;
+                }
+            }
         });
         return map;
     }
@@ -1004,8 +1219,10 @@ $(document).ready(function () {
                     };
                     // Keep existing mappings if same sys_id, else start fresh
                     const existingSysId = pendingModalItem && pendingModalItem.sysId;
-                    const savedMap = (existingSysId === sysId && pendingModalItem.fieldMappings) ? pendingModalItem.fieldMappings : {};
-                    renderMappingTable(fields, savedMap);
+                    const sameItem  = existingSysId === sysId;
+                    const savedMap  = (sameItem && pendingModalItem.fieldMappings) ? pendingModalItem.fieldMappings : {};
+                    const savedVMap = (sameItem && pendingModalItem.valueMappings) ? pendingModalItem.valueMappings : {};
+                    renderMappingTable(fields, savedMap, savedVMap);
                 }
             } else {
                 showAlert('danger', 'Could not load fields: ' + escHtml((resp && resp.error) || 'Unknown error.'));
@@ -1149,6 +1366,7 @@ $(document).ready(function () {
         }
 
         const fieldMappings = collectMappings();
+        const valueMappings = collectValueMappings();
         const criteria      = collectModalCriteria();
         const itemIndex     = pendingModalItem ? pendingModalItem.index : null;
 
@@ -1161,6 +1379,7 @@ $(document).ready(function () {
             active:        active,
             sysId:         sysId,
             fieldMappings: fieldMappings,
+            valueMappings: valueMappings,
             triggerForm:   triggerForm,
             criteria:      criteria,
             snapshot:      modalCurrentSnapshot
@@ -1171,6 +1390,7 @@ $(document).ready(function () {
                     active:        active,
                     sysId:         sysId,
                     fieldMappings: fieldMappings,
+                    valueMappings: valueMappings,
                     triggerForm:   triggerForm,
                     criteria:      criteria,
                     snapshot:      modalCurrentSnapshot
@@ -1333,7 +1553,14 @@ $(document).ready(function () {
                 { data: 'record',        render: function (d, type) { return type === 'display' ? buildRecordLink(d) : (d || ''); } },
                 { data: 'catalog_label', render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
                 { data: 'instrument',    render: function (d, type) { return type === 'display' ? escHtml(formLabelFor(d)) : (d || ''); } },
-                { data: 'request_number',   render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } }
+                { data: 'request_number',   render: function (d, type, row) {
+                    if (type !== 'display') { return d || ''; }
+                    if (!d) { return ''; }
+                    if (row && row.request_url) {
+                        return '<a href="' + escHtml(row.request_url) + '" target="_blank" rel="noopener">' + escHtml(d) + '</a>';
+                    }
+                    return escHtml(d);
+                } }
             ],
             language: {
                 emptyTable:  'No RITM submissions have been logged yet.',

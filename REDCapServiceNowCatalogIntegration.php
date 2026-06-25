@@ -97,7 +97,10 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                     );
                 }
                 $rawDataFetched = true;
-                $this->debug('Record data fetched', ['field_count' => count($recordData)]);
+                $this->debug('Record data fetched', [
+                    'field_count' => count($recordData), 
+                    'record_data' => json_encode($recordData, JSON_PRETTY_PRINT)
+                ]);
             }
 
             // Evaluate trigger criteria — all conditions must pass (AND logic)
@@ -110,10 +113,57 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             $this->debug("[$itemLabel] Criteria met — building RITM payload");
 
             // Build the RITM variable map from saved field mappings
+            $valueMappings = $item['valueMappings'] ?? [];
             $ritmVariables = [];
             foreach ((array) $fieldMappings as $snVariable => $rcField) {
-                if ($rcField !== '' && array_key_exists($rcField, $recordData)) {
-                    $ritmVariables[$snVariable] = (string) $recordData[$rcField];
+                if ($rcField === '' || !array_key_exists($rcField, $recordData)) {
+                    continue;
+                }
+
+                $rawValue    = $recordData[$rcField];
+                $variableMap = (isset($valueMappings[$snVariable]) && is_array($valueMappings[$snVariable]))
+                    ? $valueMappings[$snVariable]
+                    : [];
+                // When a value mapping is configured for this variable it is
+                // authoritative: only explicitly matched REDCap values are sent.
+                // Anything mapped to "Do not send" (or left unmatched) is omitted.
+                $hasValueMap = !empty($variableMap);
+
+                if (is_array($rawValue)) {
+                    // Checkbox fields arrive as an associative array of
+                    // choiceValue => '0'|'1'. Keep only the checked choices and,
+                    // when a value mapping exists, translate/filter them.
+                    $checkedValues = [];
+                    foreach ($rawValue as $choiceValue => $isChecked) {
+                        if ((string) $isChecked !== '1') {
+                            continue;
+                        }
+                        $choiceValue = (string) $choiceValue;
+                        if ($hasValueMap) {
+                            if (array_key_exists($choiceValue, $variableMap) && $variableMap[$choiceValue] !== '') {
+                                $checkedValues[] = (string) $variableMap[$choiceValue];
+                            }
+                            // Unmatched / "Do not send" checked choices are skipped.
+                        } else {
+                            $checkedValues[] = $choiceValue;
+                        }
+                    }
+                    // In value-map mode, omit the variable entirely when nothing
+                    // is left to send (every checked choice was "Do not send").
+                    if (!$hasValueMap || !empty($checkedValues)) {
+                        $ritmVariables[$snVariable] = implode(',', $checkedValues);
+                    }
+                } else {
+                    $rcValue = (string) $rawValue;
+                    if ($hasValueMap) {
+                        // Only send when this value is explicitly matched;
+                        // otherwise treat it as "Do not send".
+                        if (array_key_exists($rcValue, $variableMap) && $variableMap[$rcValue] !== '') {
+                            $ritmVariables[$snVariable] = (string) $variableMap[$rcValue];
+                        }
+                    } else {
+                        $ritmVariables[$snVariable] = $rcValue;
+                    }
                 }
             }
             $this->debug("[$itemLabel] RITM payload built", [
@@ -141,6 +191,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                     'catalog_label' => $item['label'] ?? '',
                     'http_code'     => $result['httpCode']               ?? null,
                     'request_number'   => $result['data']['request_number'] ?? null,
+                    'request_id'    => $result['data']['request_id'] ?? null,
                     'error'         => $result['error']                  ?? null,
                 ]
             );
@@ -209,6 +260,17 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         // ── Unfiltered total ──────────────────────────────────────────────
         $recordsTotal = (int) $this->framework->countLogs('message = ?', [self::RITM_SUCCESS_MESSAGE]);
 
+        // No submissions logged yet — the custom log parameters referenced below
+        // do not exist, so queryLogs() would throw. Return an empty page instead.
+        if ($recordsTotal === 0) {
+            return [
+                'draw'            => $draw,
+                'recordsTotal'    => 0,
+                'recordsFiltered' => 0,
+                'data'            => [],
+            ];
+        }
+
         // ── Build the filtered WHERE clause ───────────────────────────────
         $where  = 'message = ?';
         $params = [self::RITM_SUCCESS_MESSAGE];
@@ -227,14 +289,17 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         // ── Page of rows ──────────────────────────────────────────────────
         // LIMIT values must be integer literals for queryLogs; the casts above
         // guarantee they are safe to inline.
-        $sql = "select timestamp, record, instrument, catalog_label, request_number, ritm_number"
+        $sql = "select timestamp, record, instrument, catalog_label, request_number, request_id"
              . " where $where"
              . " order by $orderField $orderDir, log_id $orderDir"
              . " limit " . (int) $start . ", " . (int) $length;
 
+        $instanceUrl = rtrim((string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? ''), '/');
+
         $data   = [];
         $result = $this->framework->queryLogs($sql, $params);
         while ($row = $result->fetch_assoc()) {
+            $requestId = $row['request_id'] ?? null;
             $data[] = [
                 // 'log_id'        => $row['log_id'],
                 'timestamp'     => $row['timestamp'],
@@ -244,7 +309,10 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'instrument'    => $row['instrument'],
                 // 'instance'      => $row['instance'],
                 'catalog_label' => $row['catalog_label'],
-                'request_number'   => $row['request_number'] ?? $row['ritm_number'],
+                'request_number'   => $row['request_number'] ?? null,
+                'request_url'   => ($instanceUrl !== '' && !empty($requestId))
+                    ? $instanceUrl . '/now/nav/ui/classic/params/target/' . rawurlencode('sc_request.do?sys_id=' . $requestId)
+                    : null,
                 // 'http_code'     => $row['http_code'],
             ];
         }
@@ -259,7 +327,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 
     /**
      * Returns all configured catalog items as an array of associative arrays.
-     * Each element has: label, active, sysId, fieldMappings, snapshot, triggerForm, criteria.
+     * Each element has: label, active, sysId, fieldMappings, valueMappings, snapshot, triggerForm, criteria.
      */
     public function getCatalogItems(): array
     {
@@ -267,6 +335,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $actives   = (array) ($this->framework->getProjectSetting('catalog-item-active')           ?? []);
         $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
         $mappings  = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
+        $valueMaps = (array) ($this->framework->getProjectSetting('catalog-item-value-mappings')   ?? []);
         $snapshots = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
         $forms     = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
         $criteria  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
@@ -279,6 +348,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'active'        => ($actives[$i] ?? '') === '1',
                 'sysId'         => (string) ($sysIds[$i] ?? ''),
                 'fieldMappings' => $this->decodeProjectSettingJson($mappings[$i] ?? [], []),
+                'valueMappings' => $this->decodeProjectSettingJson($valueMaps[$i] ?? [], []),
                 'snapshot'      => $this->decodeProjectSettingJson($snapshots[$i] ?? null, null),
                 'triggerForm'   => (string) ($forms[$i] ?? ''),
                 'criteria'      => $this->decodeProjectSettingJson($criteria[$i] ?? [], []),
@@ -313,6 +383,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $active        = !empty($payload['active']);
         $sysId         = trim($payload['sysId']       ?? '');
         $fieldMappings = $payload['fieldMappings']    ?? [];
+        $valueMappings = $payload['valueMappings']    ?? [];
         $triggerForm   = $payload['triggerForm']      ?? '';
         $criteria      = $payload['criteria']         ?? [];
         $snapshot      = $payload['snapshot']         ?? null;
@@ -329,6 +400,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $actives   = (array) ($this->framework->getProjectSetting('catalog-item-active')           ?? []);
         $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
         $mapsArr   = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
+        $valMapsArr = (array) ($this->framework->getProjectSetting('catalog-item-value-mappings')  ?? []);
         $snapsArr  = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
         $formsArr  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
         $critArr   = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
@@ -342,6 +414,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $actives[$index]  = $active ? '1' : '0';
         $sysIds[$index]   = $sysId;
         $mapsArr[$index]  = json_encode(is_array($fieldMappings) ? $fieldMappings : []);
+        $valMapsArr[$index] = json_encode(is_array($valueMappings) ? $valueMappings : []);
         $snapsArr[$index] = $snapshot !== null ? json_encode($snapshot) : null;
         $formsArr[$index] = $triggerForm;
         $critArr[$index]  = json_encode(is_array($criteria) ? $criteria : []);
@@ -350,6 +423,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $this->framework->setProjectSetting('catalog-item-active',            $actives);
         $this->framework->setProjectSetting('catalog-item-sys-id',            $sysIds);
         $this->framework->setProjectSetting('catalog-item-field-mappings',    $mapsArr);
+        $this->framework->setProjectSetting('catalog-item-value-mappings',    $valMapsArr);
         $this->framework->setProjectSetting('catalog-item-snapshot',          $snapsArr);
         $this->framework->setProjectSetting('catalog-item-trigger-form',      $formsArr);
         $this->framework->setProjectSetting('catalog-item-trigger-criteria',  $critArr);
@@ -369,6 +443,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             'catalog-item-active',
             'catalog-item-sys-id',
             'catalog-item-field-mappings',
+            'catalog-item-value-mappings',
             'catalog-item-snapshot',
             'catalog-item-trigger-form',
             'catalog-item-trigger-criteria',

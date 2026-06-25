@@ -79,6 +79,13 @@
                     "hidden": true
                 },
                 {
+                    "key": "catalog-item-value-mappings",
+                    "name": "Value Mappings (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
                     "key": "catalog-item-snapshot",
                     "name": "Field Snapshot (JSON)",
                     "type": "text",
