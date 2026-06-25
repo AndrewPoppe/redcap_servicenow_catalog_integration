@@ -132,7 +132,7 @@ foreach ($redcapForms as $form) {
     }
     .sn-badge-required { background: #fce4e4; color: #c0392b; border: 1px solid #f1c0c0; }
     #test-status { font-size: 0.9rem; }
-    #sn-config-page .input-group-append .btn { border-left: 0; }
+    /* #sn-config-page .input-group-append .btn { border-left: 0; } */
     #catalog-items-table { margin-bottom: 0; }
     #catalog-items-table th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; background: #f8f9fa; }
     #catalog-items-empty { padding: 2.5rem 1rem; }
@@ -285,12 +285,10 @@ foreach ($redcapForms as $form) {
                                autocomplete="current-password"
                                placeholder="<?= $hasPassword ? 'Saved — enter to change' : 'Enter password' ?>"
                                data-has-saved="<?= $hasPassword ? '1' : '0' ?>">
-                        <div class="input-group-append">
-                            <button class="btn btn-outline-secondary" type="button" id="btn-toggle-pw"
-                                    title="Show / hide password">
-                                <i class="fas fa-eye" id="pw-eye-icon"></i>
-                            </button>
-                        </div>
+                        <button class="btn btn-outline-secondary" type="button" id="btn-toggle-pw"
+                                title="Show / hide password">
+                            <i class="fas fa-eye" id="pw-eye-icon"></i>
+                        </button>
                     </div>
                     <?php if ($hasPassword): ?>
                     <small class="form-text text-muted">A password is saved. Leave blank to keep it.</small>
@@ -429,11 +427,9 @@ foreach ($redcapForms as $form) {
                                        style="font-family:monospace"
                                        placeholder="e.g. 1a2b3c4d5e6f7890abcdef1234567890"
                                        maxlength="32">
-                                <div class="input-group-append">
-                                    <button class="btn btn-primary" id="btn-modal-fetch" type="button">
-                                        <i class="fas fa-sync-alt mr-1"></i> Load Fields
-                                    </button>
-                                </div>
+                                <button class="btn btn-primary" id="btn-modal-fetch" type="button">
+                                    <i class="fas fa-sync-alt mr-1"></i> Load Fields
+                                </button>
                             </div>
                             <small class="form-text text-muted">The 32-character hexadecimal sys_id of the ServiceNow catalog item.</small>
                         </div>
