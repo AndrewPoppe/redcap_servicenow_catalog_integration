@@ -86,6 +86,13 @@
                     "hidden": true
                 },
                 {
+                    "key": "catalog-item-attachment-fields",
+                    "name": "Attachment Fields (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
+                },
+                {
                     "key": "catalog-item-snapshot",
                     "name": "Field Snapshot (JSON)",
                     "type": "text",

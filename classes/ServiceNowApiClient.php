@@ -106,6 +106,87 @@ class ServiceNowApiClient
         );
     }
 
+    /**
+     * Resolves the Request Item (RITM) sys_id belonging to a submitted request.
+     *
+     * The `order_now` response returns the sys_id of the parent request
+     * (sc_request). Attachments must be posted against the request *item*
+     * (sc_req_item), so this looks up the RITM linked to that request via the
+     * Table API.
+     *
+     * @param  string $requestSysId  sys_id of the sc_request record (order_now `request_id`).
+     * @return array{success: bool, sysId?: string, error?: string, httpCode?: int}
+     */
+    public function getRequestItemSysId(string $requestSysId): array
+    {
+        $id = $this->sanitizeSysId($requestSysId);
+        if ($id === '') {
+            return ['success' => false, 'error' => 'Invalid request sys_id.'];
+        }
+
+        $result = $this->get(
+            '/api/now/table/sc_req_item'
+            . '?sysparm_query=' . rawurlencode('request=' . $id)
+            . '&sysparm_fields=sys_id'
+            . '&sysparm_limit=1'
+        );
+
+        if (!$result['success']) {
+            return $result;
+        }
+
+        $rows  = is_array($result['data'] ?? null) ? $result['data'] : [];
+        $sysId = isset($rows[0]['sys_id']) ? (string) $rows[0]['sys_id'] : '';
+        if ($sysId === '') {
+            return ['success' => false, 'error' => 'No request item found for request ' . $id . '.'];
+        }
+
+        return ['success' => true, 'sysId' => $sysId];
+    }
+
+    /**
+     * Uploads a binary file as an attachment on a target record.
+     *
+     * Uses the ServiceNow Attachment API:
+     *   POST /api/now/attachment/file?table_name=...&table_sys_id=...&file_name=...
+     * with the raw file bytes as the request body.
+     *
+     * @param  string $tableSysId  sys_id of the record to attach the file to.
+     * @param  string $fileName    Name to store the attachment under.
+     * @param  string $mimeType    MIME type of the file (used as Content-Type).
+     * @param  string $binaryData  Raw binary contents of the file.
+     * @param  string $tableName   Target table (default: sc_req_item).
+     * @return array{success: bool, data?: mixed, error?: string, httpCode?: int}
+     */
+    public function uploadAttachment(
+        string $tableSysId,
+        string $fileName,
+        string $mimeType,
+        string $binaryData,
+        string $tableName = 'sc_req_item'
+    ): array {
+        $sysId = $this->sanitizeSysId($tableSysId);
+        if ($sysId === '') {
+            return ['success' => false, 'error' => 'Invalid table sys_id.'];
+        }
+        if ($fileName === '') {
+            return ['success' => false, 'error' => 'Attachment file name is required.'];
+        }
+
+        $query = http_build_query([
+            'table_name'   => $tableName,
+            'table_sys_id' => $sysId,
+            'file_name'    => $fileName,
+        ]);
+
+        return $this->requestBinary(
+            'POST',
+            '/api/now/attachment/file?' . $query,
+            $binaryData,
+            $mimeType !== '' ? $mimeType : 'application/octet-stream'
+        );
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
 
     private function get(string $path): array
@@ -154,6 +235,69 @@ class ServiceNowApiClient
         if ($payload !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
         }
+
+        $response = curl_exec($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr  = curl_error($ch);
+        curl_close($ch);
+
+        if ($curlErr !== '') {
+            return ['success' => false, 'error' => 'Connection failed: ' . $curlErr];
+        }
+
+        $decoded = json_decode($response, true);
+
+        if ($httpCode >= 200 && $httpCode < 300) {
+            return [
+                'success'  => true,
+                'data'     => $decoded['result'] ?? $decoded,
+                'httpCode' => $httpCode,
+            ];
+        }
+
+        $errMsg = $decoded['error']['message']
+               ?? $decoded['error']['detail']
+               ?? ('Unexpected HTTP ' . $httpCode);
+
+        return ['success' => false, 'error' => $errMsg, 'httpCode' => $httpCode];
+    }
+
+    /**
+     * Executes an HTTP request that sends a raw (non-JSON) body, such as a
+     * binary file upload. Mirrors request() but sets a caller-supplied
+     * Content-Type and passes the body through untouched.
+     *
+     * @param  string $method       HTTP verb.
+     * @param  string $path         Path relative to the instance base URL; must start with /.
+     * @param  string $body         Raw request body (e.g. binary file contents).
+     * @param  string $contentType  Value for the Content-Type header.
+     * @return array{success: bool, data?: mixed, error?: string, httpCode?: int}
+     */
+    private function requestBinary(string $method, string $path, string $body, string $contentType): array
+    {
+        if (!function_exists('curl_init')) {
+            return ['success' => false, 'error' => 'cURL is not available on this server.'];
+        }
+
+        if (!preg_match('#^https://#i', $this->instanceUrl)) {
+            return ['success' => false, 'error' => 'Instance URL must use HTTPS (https://).'];
+        }
+
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $this->instanceUrl . $path,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: Basic ' . base64_encode($this->username . ':' . $this->password),
+                'Accept: application/json',
+                'Content-Type: ' . $contentType,
+            ],
+            CURLOPT_POSTFIELDS     => $body,
+            CURLOPT_TIMEOUT        => 60,
+            CURLOPT_SSL_VERIFYPEER => $this->verifySsl,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
 
         $response = curl_exec($ch);
         $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);

@@ -115,11 +115,21 @@ foreach ($redcapForms as $form) {
     #modal-mapping-table tbody tr:hover {
         background-color: #f5f7ff;
     }
-    .rc-field-select { min-width: 230px; }
+    .rc-field-select { min-width: 230px; max-width: 320px; }
     .select2-container { min-width: 230px; }
+    /* Cap width only on the field-mapping dropdowns so the clear (×) stays reachable */
+    #modal-mapping-tbody .select2-container { max-width: 320px; }
     .select2-container .select2-selection--single { height: 31px; }
-    .select2-container--default .select2-selection--single .select2-selection__rendered { line-height: 29px; padding-right: 28px; }
+    .select2-container--default .select2-selection--single .select2-selection__rendered {
+        line-height: 29px;
+        padding-right: 24px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
     .select2-container--default .select2-selection--single .select2-selection__arrow { height: 29px; }
+    /* Keep the clear (×) button clear of the truncated text and the dropdown arrow */
+    .select2-container--default .select2-selection--single .select2-selection__clear { margin-right: 4px; }
     .criterion-field-wrap .select2-container { min-width: 0; }
     .sn-badge {
         font-size: 0.7em;
@@ -464,6 +474,26 @@ foreach ($redcapForms as $form) {
                     </div>
                 </div>
 
+                <!-- Attachments -->
+                <div class="card shadow-sm mb-4">
+                    <div class="card-header">
+                        <i class="fas fa-paperclip mr-1"></i> Attachments
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group mb-0">
+                            <label for="modal-attachment-fields" class="font-weight-bold">
+                                File Upload Fields
+                            </label>
+                            <select class="form-control" id="modal-attachment-fields" multiple></select>
+                            <small class="form-text text-muted">
+                                Files uploaded to the selected REDCap fields will be attached to the
+                                request item (RITM) after it is created. Only <em>File Upload</em> fields
+                                are listed.
+                            </small>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Trigger Settings -->
                 <div class="card shadow-sm mb-2">
                     <div class="card-header">
@@ -714,6 +744,34 @@ $(document).ready(function () {
         return '<select class="form-select form-select-sm rc-field-select">' + buildFormGroupedOptions(selectedValue) + '</select>';
     }
 
+    // Builds <optgroup>ed <option>s for REDCap file-upload fields, used by the
+    // attachments multi-select. `selected` is an array of field names.
+    function buildFileFieldOptions(selected) {
+        selected = Array.isArray(selected) ? selected : [];
+        const formOrder = [];
+        const byForm    = {};
+        RC_FIELDS.forEach(function (f) {
+            if (f.type !== 'file') return;
+            if (!byForm[f.form]) {
+                formOrder.push(f.form);
+                byForm[f.form] = [];
+            }
+            byForm[f.form].push(f);
+        });
+        let opts = '';
+        formOrder.forEach(function (form) {
+            const formLabel = form.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+            opts += '<optgroup label="' + escHtml(formLabel) + '">';
+            byForm[form].forEach(function (f) {
+                const sel  = (selected.indexOf(f.name) !== -1) ? ' selected' : '';
+                const text = escHtml(f.label) + ' [' + escHtml(f.name) + ']';
+                opts += '<option value="' + escHtml(f.name) + '"' + sel + '>' + text + '</option>';
+            });
+            opts += '</optgroup>';
+        });
+        return opts;
+    }
+
     function buildValueInput(fieldName, currentValue, hide) {
         const style   = 'max-width:200px' + (hide ? ';display:none' : '');
         const choices = fieldName ? (RC_FIELD_CHOICES[fieldName] || null) : null;
@@ -888,6 +946,14 @@ $(document).ready(function () {
 
     $('#btn-value-match-save').on('click', applyValueMatch);
 
+    // Select2 quirk: clicking the clear (×) button both clears the value AND
+    // reopens the dropdown. Suppress the open that immediately follows a clear.
+    $(document).on('select2:clear', 'select', function () {
+        $(this).one('select2:opening', function (e) {
+            e.preventDefault();
+        });
+    });
+
     $('#modal-mapping-tbody').on('click', '.btn-match-values', function () {
         openValueMatchModal($(this).closest('tr'));
     });
@@ -974,6 +1040,7 @@ $(document).ready(function () {
         $('#modal-mapping-table-section').hide();
         $('#modal-mapping-tbody').empty();
         $('#modal-mapping-count').hide().text('');
+        $('#modal-attachment-fields').empty().val(null);
         $('#modal-criteria-container').empty();
         $('#modal-criteria-empty').show();
         modalCurrentSnapshot = null;
@@ -1005,6 +1072,17 @@ $(document).ready(function () {
             modalCurrentSnapshot = item.snapshot;
             renderMappingTable(item.snapshot.variables, item.fieldMappings || {}, item.valueMappings || {});
         }
+
+        // Attachment fields multi-select
+        const attachSelected = (item && Array.isArray(item.attachmentFields)) ? item.attachmentFields : [];
+        $('#modal-attachment-fields')
+            .html(buildFileFieldOptions(attachSelected))
+            .select2({
+                width:          '100%',
+                placeholder:    '— Select file upload fields —',
+                allowClear:     true,
+                dropdownParent: $('#catalog-item-modal')
+            });
     });
 
     $('#catalog-item-modal').on('hidden.bs.modal', function () {
@@ -1364,6 +1442,7 @@ $(document).ready(function () {
         const fieldMappings = collectMappings();
         const valueMappings = collectValueMappings();
         const criteria      = collectModalCriteria();
+        const attachmentFields = $('#modal-attachment-fields').val() || [];
         const itemIndex     = pendingModalItem ? pendingModalItem.index : null;
 
         const $btn = $(this).prop('disabled', true)
@@ -1376,6 +1455,7 @@ $(document).ready(function () {
             sysId:         sysId,
             fieldMappings: fieldMappings,
             valueMappings: valueMappings,
+            attachmentFields: attachmentFields,
             triggerForm:   triggerForm,
             criteria:      criteria,
             snapshot:      modalCurrentSnapshot
@@ -1387,6 +1467,7 @@ $(document).ready(function () {
                     sysId:         sysId,
                     fieldMappings: fieldMappings,
                     valueMappings: valueMappings,
+                    attachmentFields: attachmentFields,
                     triggerForm:   triggerForm,
                     criteria:      criteria,
                     snapshot:      modalCurrentSnapshot

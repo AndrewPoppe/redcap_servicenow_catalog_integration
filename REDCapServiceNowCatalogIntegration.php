@@ -195,6 +195,20 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                     'error'         => $result['error']                  ?? null,
                 ]
             );
+
+            // Upload any mapped file-upload fields as RITM attachments. Files
+            // cannot be sent through order_now, so this runs as a follow-up step
+            // only when the RITM was created successfully.
+            $attachmentFields = array_values(array_filter((array) ($item['attachmentFields'] ?? [])));
+            if ($result['success'] && !empty($attachmentFields)) {
+                $requestId = (string) ($result['data']['request_id'] ?? '');
+                $this->processAttachments($attachmentFields, $recordData, $requestId, $itemLabel, [
+                    'record'     => $record,
+                    'event_id'   => $event_id,
+                    'instrument' => $instrument,
+                    'instance'   => $repeat_instance,
+                ]);
+            }
         }
 
         $this->debug('redcap_save_record complete');
@@ -336,6 +350,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
         $mappings  = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
         $valueMaps = (array) ($this->framework->getProjectSetting('catalog-item-value-mappings')   ?? []);
+        $attachFds = (array) ($this->framework->getProjectSetting('catalog-item-attachment-fields') ?? []);
         $snapshots = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
         $forms     = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
         $criteria  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
@@ -344,14 +359,15 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $items = [];
         for ($i = 0; $i < $count; $i++) {
             $items[] = [
-                'label'         => (string) ($labels[$i] ?? ''),
-                'active'        => ($actives[$i] ?? '') === '1',
-                'sysId'         => (string) ($sysIds[$i] ?? ''),
-                'fieldMappings' => $this->decodeProjectSettingJson($mappings[$i] ?? [], []),
-                'valueMappings' => $this->decodeProjectSettingJson($valueMaps[$i] ?? [], []),
-                'snapshot'      => $this->decodeProjectSettingJson($snapshots[$i] ?? null, null),
-                'triggerForm'   => (string) ($forms[$i] ?? ''),
-                'criteria'      => $this->decodeProjectSettingJson($criteria[$i] ?? [], []),
+                'label'            => (string) ($labels[$i] ?? ''),
+                'active'           => ($actives[$i] ?? '') === '1',
+                'sysId'            => (string) ($sysIds[$i] ?? ''),
+                'fieldMappings'    => $this->decodeProjectSettingJson($mappings[$i] ?? [], []),
+                'valueMappings'    => $this->decodeProjectSettingJson($valueMaps[$i] ?? [], []),
+                'attachmentFields' => $this->decodeProjectSettingJson($attachFds[$i] ?? [], []),
+                'snapshot'         => $this->decodeProjectSettingJson($snapshots[$i] ?? null, null),
+                'triggerForm'      => (string) ($forms[$i] ?? ''),
+                'criteria'         => $this->decodeProjectSettingJson($criteria[$i] ?? [], []),
             ];
         }
         return $items;
@@ -384,6 +400,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $sysId         = trim($payload['sysId']       ?? '');
         $fieldMappings = $payload['fieldMappings']    ?? [];
         $valueMappings = $payload['valueMappings']    ?? [];
+        $attachFields  = $payload['attachmentFields'] ?? [];
         $triggerForm   = $payload['triggerForm']      ?? '';
         $criteria      = $payload['criteria']         ?? [];
         $snapshot      = $payload['snapshot']         ?? null;
@@ -401,6 +418,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
         $mapsArr   = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
         $valMapsArr = (array) ($this->framework->getProjectSetting('catalog-item-value-mappings')  ?? []);
+        $attachArr = (array) ($this->framework->getProjectSetting('catalog-item-attachment-fields') ?? []);
         $snapsArr  = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
         $formsArr  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
         $critArr   = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
@@ -415,18 +433,20 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $sysIds[$index]   = $sysId;
         $mapsArr[$index]  = json_encode(is_array($fieldMappings) ? $fieldMappings : []);
         $valMapsArr[$index] = json_encode(is_array($valueMappings) ? $valueMappings : []);
+        $attachArr[$index] = json_encode(is_array($attachFields) ? array_values($attachFields) : []);
         $snapsArr[$index] = $snapshot !== null ? json_encode($snapshot) : null;
         $formsArr[$index] = $triggerForm;
         $critArr[$index]  = json_encode(is_array($criteria) ? $criteria : []);
 
-        $this->framework->setProjectSetting('catalog-item-label',             $labels);
-        $this->framework->setProjectSetting('catalog-item-active',            $actives);
-        $this->framework->setProjectSetting('catalog-item-sys-id',            $sysIds);
-        $this->framework->setProjectSetting('catalog-item-field-mappings',    $mapsArr);
-        $this->framework->setProjectSetting('catalog-item-value-mappings',    $valMapsArr);
-        $this->framework->setProjectSetting('catalog-item-snapshot',          $snapsArr);
-        $this->framework->setProjectSetting('catalog-item-trigger-form',      $formsArr);
-        $this->framework->setProjectSetting('catalog-item-trigger-criteria',  $critArr);
+        $this->framework->setProjectSetting('catalog-item-label',              $labels);
+        $this->framework->setProjectSetting('catalog-item-active',             $actives);
+        $this->framework->setProjectSetting('catalog-item-sys-id',             $sysIds);
+        $this->framework->setProjectSetting('catalog-item-field-mappings',     $mapsArr);
+        $this->framework->setProjectSetting('catalog-item-value-mappings',     $valMapsArr);
+        $this->framework->setProjectSetting('catalog-item-attachment-fields',  $attachArr);
+        $this->framework->setProjectSetting('catalog-item-snapshot',           $snapsArr);
+        $this->framework->setProjectSetting('catalog-item-trigger-form',       $formsArr);
+        $this->framework->setProjectSetting('catalog-item-trigger-criteria',   $critArr);
 
         return ['success' => true, 'index' => $index];
     }
@@ -444,6 +464,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             'catalog-item-sys-id',
             'catalog-item-field-mappings',
             'catalog-item-value-mappings',
+            'catalog-item-attachment-fields',
             'catalog-item-snapshot',
             'catalog-item-trigger-form',
             'catalog-item-trigger-criteria',
@@ -492,6 +513,106 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     private function getServiceNowFields(string $catalogItemId): array
     {
         return $this->getApiClient()->getCatalogItemVariables($catalogItemId);
+    }
+
+    /**
+     * Uploads REDCap file-upload field contents as attachments on a newly
+     * created RITM.
+     *
+     * Because the order_now endpoint cannot carry files, this runs as a
+     * follow-up: resolve the RITM sys_id from the parent request, then POST each
+     * file's raw bytes to the ServiceNow Attachment API. File contents are read
+     * via the public REDCap::getFile() developer method.
+     *
+     * @param string[] $attachmentFields REDCap file-upload field names to send.
+     * @param array    $recordData       Flat field→value map for the saved record.
+     * @param string   $requestId        order_now `request_id` (sc_request sys_id).
+     * @param string   $itemLabel        Catalog item label, for debug output.
+     * @param array    $logContext       Extra context merged into the audit log.
+     */
+    private function processAttachments(
+        array $attachmentFields,
+        array $recordData,
+        string $requestId,
+        string $itemLabel,
+        array $logContext = []
+    ): void {
+        if ($requestId === '') {
+            $this->debug("[$itemLabel] Cannot upload attachments — missing request_id");
+            return;
+        }
+
+        // Collect fields that actually hold an uploaded file (an edoc id).
+        $pendingFields = [];
+        foreach ($attachmentFields as $field) {
+            $edocId = $recordData[$field] ?? '';
+            if (is_numeric($edocId) && (int) $edocId > 0) {
+                $pendingFields[$field] = (int) $edocId;
+            }
+        }
+        if (empty($pendingFields)) {
+            $this->debug("[$itemLabel] No uploaded files found for configured attachment fields — skipping");
+            return;
+        }
+
+        // Resolve the RITM sys_id once (all files attach to the same RITM).
+        $client = $this->getApiClient();
+        $ritm   = $client->getRequestItemSysId($requestId);
+        if (!($ritm['success'] ?? false)) {
+            $this->debug("[$itemLabel] Could not resolve RITM sys_id for attachments", [
+                'request_id' => $requestId,
+                'error'      => $ritm['error'] ?? null,
+            ]);
+            $this->framework->log('ServiceNow attachment upload failed', array_merge($logContext, [
+                'catalog_label' => $itemLabel,
+                'error'         => 'Could not resolve request item: ' . ($ritm['error'] ?? 'unknown error'),
+            ]));
+            return;
+        }
+        $ritmSysId = (string) $ritm['sysId'];
+
+        foreach ($pendingFields as $field => $edocId) {
+            $contents = \REDCap::getFile($edocId);
+            if (!is_array($contents) || count($contents) < 3) {
+                $this->debug("[$itemLabel] Could not read file contents for field '$field'", [
+                    'edoc_id' => $edocId,
+                ]);
+                $this->framework->log('ServiceNow attachment upload failed', array_merge($logContext, [
+                    'catalog_label' => $itemLabel,
+                    'field'         => $field,
+                    'error'         => 'Could not read uploaded file (edoc ' . $edocId . ').',
+                ]));
+                continue;
+            }
+
+            [$mimeType, $fileName, $binary] = $contents;
+            $upload = $client->uploadAttachment(
+                $ritmSysId,
+                (string) $fileName,
+                (string) $mimeType,
+                (string) $binary
+            );
+
+            $this->debug("[$itemLabel] Attachment upload response", [
+                'field'     => $field,
+                'file_name' => $fileName,
+                'success'   => $upload['success'] ?? false,
+                'http_code' => $upload['httpCode'] ?? null,
+                'error'     => $upload['error'] ?? null,
+            ]);
+
+            $this->framework->log(
+                'ServiceNow attachment upload ' . (($upload['success'] ?? false) ? 'succeeded' : 'failed'),
+                array_merge($logContext, [
+                    'catalog_label' => $itemLabel,
+                    'field'         => $field,
+                    'file_name'     => (string) $fileName,
+                    'ritm_sys_id'   => $ritmSysId,
+                    'http_code'     => $upload['httpCode'] ?? null,
+                    'error'         => $upload['error'] ?? null,
+                ])
+            );
+        }
     }
 
     /**
