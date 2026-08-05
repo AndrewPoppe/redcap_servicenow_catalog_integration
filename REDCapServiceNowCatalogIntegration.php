@@ -15,16 +15,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 {
 
     /** Set to true to write verbose debug entries to the EM log. */
-    private const DEBUG = true;
-
-    /**
-     * This function is called via a cron job. It is meant to check for changes in the ServiceNow catalog items that
-     * have been configured in REDCap. If changes are detected, it should alert the appropriate users.
-     */
-    public function checkCatalogChanges()
-    {
-
-    }
+    private const DEBUG = false;
 
     public function redcap_save_record( $project_id, $record, $instrument, $event_id, $group_id = NULL, $survey_hash = NULL, $response_id = NULL, $repeat_instance = 1 ) {
         $this->debug('redcap_save_record fired', [
@@ -103,7 +94,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 ]);
             }
 
-            // Evaluate trigger criteria — all conditions must pass (AND logic)
+            // Evaluate trigger criteria — groups are OR'd, conditions within a group are AND'd
             $criteria = $item['criteria'] ?? [];
             $this->debug("[$itemLabel] Evaluating criteria", ['criteria_count' => count($criteria)]);
             if (!$this->meetsCriteria((array) $criteria, $recordData)) {
@@ -224,6 +215,8 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 return $this->testConnection($payload);
             case 'saveConnectionSettings':
                 return $this->saveConnectionSettings($payload);
+            case 'deleteConnectionSettings':
+                return $this->deleteConnectionSettings();
             case 'getServiceNowFields':
                 $catalogItemId = $payload['sysId'] ?? '';
                 if (empty($catalogItemId)) {
@@ -485,16 +478,31 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 
     private function saveConnectionSettings(array $payload)
     {
-        $instanceUrl = $payload['instanceUrl'] ?? '';
-        $username    = $payload['username']    ?? '';
-        $password    = $payload['password']    ?? '';
-        if (empty($instanceUrl) || empty($username) || empty($password)) {
+        $instanceUrl = trim($payload['instanceUrl'] ?? '');
+        $username    = trim($payload['username']    ?? '');
+        $password    =      $payload['password']    ?? '';
+
+        // The UI sends this sentinel when the password field was left blank,
+        // meaning the previously saved password should be kept as-is.
+        if ($password === '__SAVED__') {
+            $password = (string) ($this->framework->getProjectSetting('servicenow-password') ?? '');
+        }
+
+        if ($instanceUrl === '' || $username === '' || $password === '') {
             return ['success' => false, 'message' => 'Missing required parameters.'];
         }
         $this->framework->setProjectSetting('servicenow-instance-url', $instanceUrl);
         $this->framework->setProjectSetting('servicenow-username',      $username);
         $this->framework->setProjectSetting('servicenow-password',      $password);
         return ['success' => true, 'message' => 'Connection settings saved successfully.'];
+    }
+
+    private function deleteConnectionSettings(): array
+    {
+        $this->framework->removeProjectSetting('servicenow-instance-url');
+        $this->framework->removeProjectSetting('servicenow-username');
+        $this->framework->removeProjectSetting('servicenow-password');
+        return ['success' => true, 'message' => 'Connection settings deleted.'];
     }
 
     private function testConnection(array $payload): array
@@ -632,12 +640,19 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     }
 
     /**
-     * Returns true when every criterion in $criteria is satisfied by $recordData.
+     * Returns true when the criteria are satisfied by $recordData.
+     *
+     * $criteria is a list of groups; each group is a list of {field, operator,
+     * value} objects. All criteria within a group must pass (AND), and at
+     * least one group must fully pass (OR) — i.e. disjunction of conjunctions.
      * An empty criteria array is always satisfied (no conditions = always push).
+     *
+     * For backward compatibility, a flat array of criterion objects (the
+     * pre-OR-group format) is treated as a single AND group.
      *
      * Supported operators: eq, neq, contains, not_empty, empty.
      *
-     * @param array $criteria   Array of {field, operator, value} objects.
+     * @param array $criteria   Array of criterion groups (or, for legacy data, a flat array of criterion objects).
      * @param array $recordData Flat field→value map for the current record/event.
      */
     /**
@@ -661,6 +676,30 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 
     private function meetsCriteria(array $criteria, array $recordData): bool
     {
+        if (empty($criteria)) {
+            return true;
+        }
+
+        // Legacy format: a flat array of criterion objects (has 'field' directly
+        // on the first element) rather than an array of groups.
+        if (isset($criteria[0]) && is_array($criteria[0]) && array_key_exists('field', $criteria[0])) {
+            $criteria = [$criteria];
+        }
+
+        foreach ($criteria as $group) {
+            if (is_array($group) && !empty($group) && $this->groupMeetsCriteria($group, $recordData)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns true when every criterion in $criteria (a single AND group) is satisfied.
+     */
+    private function groupMeetsCriteria(array $criteria, array $recordData): bool
+    {
         foreach ($criteria as $criterion) {
             $field    =          $criterion['field']    ?? '';
             $operator = (string) ($criterion['operator'] ?? 'eq');
@@ -670,7 +709,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 continue;
             }
 
-            $actual = (string) ($recordData[$field] ?? '');
+            $actual = $this->resolveCriterionFieldValue($field, $recordData);
 
             switch ($operator) {
                 case 'eq':
@@ -700,5 +739,33 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         return true;
     }
 
+    /**
+     * Resolves the comparison value for a single trigger criterion field.
+     *
+     * Checkbox options are addressed as "<field>___<code>" (mirroring REDCap's
+     * own export naming convention). Since REDCap::getData() with
+     * return_format=array returns checkbox fields as an associative array of
+     * choiceCode => '0'|'1', this looks up that specific choice's checked state.
+     * Regular fields are returned as-is.
+     *
+     * @param string $field      Criterion field name, possibly a checkbox option.
+     * @param array  $recordData Flat field→value map for the current record/event.
+     */
+    private function resolveCriterionFieldValue(string $field, array $recordData): string
+    {
+        $sep = strpos($field, '___');
+        if ($sep !== false) {
+            $baseField    = substr($field, 0, $sep);
+            $choiceCode   = substr($field, $sep + 3);
+            $checkboxData = $recordData[$baseField] ?? null;
+            if (is_array($checkboxData)) {
+                return (string) ($checkboxData[$choiceCode] ?? '0');
+            }
+            return '0';
+        }
+
+        $value = $recordData[$field] ?? '';
+        return is_array($value) ? '' : (string) $value;
+    }
 
 }

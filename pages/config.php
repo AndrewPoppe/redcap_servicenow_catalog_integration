@@ -313,6 +313,10 @@ foreach ($redcapForms as $form) {
                 <button class="btn btn-outline-success" id="btn-save-connection" type="button" disabled>
                     <i class="fas fa-save mr-1"></i> Save Connection Settings
                 </button>
+                <button class="btn btn-outline-danger" id="btn-delete-connection" type="button"
+                        style="<?= ($savedUrl === '' && !$hasPassword) ? 'display:none' : '' ?>">
+                    <i class="fas fa-trash mr-1"></i> Delete Connection Settings
+                </button>
                 <span id="test-status"></span>
             </div>
 
@@ -513,7 +517,7 @@ foreach ($redcapForms as $form) {
                             </select>
                             <small class="form-text text-muted">
                                 When this instrument is saved, the module evaluates the criteria below and
-                                pushes the record to ServiceNow if all conditions are met.
+                                pushes the record to ServiceNow if any condition group is satisfied.
                             </small>
                         </div>
 
@@ -522,12 +526,16 @@ foreach ($redcapForms as $form) {
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <label class="font-weight-bold mb-0">
                                 Push Criteria
-                                <small class="font-weight-normal text-muted ml-1">(optional — all conditions must pass)</small>
+                                <small class="font-weight-normal text-muted ml-1">(optional)</small>
                             </label>
-                            <button class="btn btn-sm btn-outline-secondary" id="btn-modal-add-criterion" type="button">
-                                <i class="fas fa-plus mr-1"></i> Add Criterion
+                            <button class="btn btn-sm btn-outline-secondary" id="btn-modal-add-group" type="button">
+                                <i class="fas fa-plus mr-1"></i> Add Condition Group
                             </button>
                         </div>
+                        <small class="form-text text-muted mb-2">
+                            Conditions within a group must <strong>all</strong> match (AND). If there is more than
+                            one group, the push fires when <strong>any</strong> group matches (OR).
+                        </small>
 
                         <div id="modal-criteria-container"></div>
                         <p id="modal-criteria-empty" class="text-muted small mb-0">
@@ -567,6 +575,30 @@ foreach ($redcapForms as $form) {
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-danger" id="btn-confirm-delete">
+                    <i class="fas fa-trash mr-1"></i> Delete
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<!-- ── Delete Connection Settings Confirmation Modal ──────────────────────── -->
+<div class="modal fade" id="delete-connection-confirm-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Confirm Delete</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to delete the saved ServiceNow connection settings
+                   (instance URL, username, and password)?</p>
+                <p class="text-danger mb-0"><small><i class="fas fa-exclamation-triangle mr-1"></i>This action cannot be undone.</small></p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btn-confirm-delete-connection">
                     <i class="fas fa-trash mr-1"></i> Delete
                 </button>
             </div>
@@ -652,6 +684,34 @@ $(document).ready(function () {
         }
     });
 
+    // Trigger criteria need to test individual checkbox options (a checkbox
+    // field itself has no single value), so each option is expanded into its
+    // own selectable pseudo-field named "<field>___<code>" — matching REDCap's
+    // own export naming convention for checkboxes.
+    const RC_CRITERIA_FIELDS = [];
+    RC_FIELDS.forEach(function (f) {
+        if (f.type === 'checkbox' && Array.isArray(f.choices) && f.choices.length > 0) {
+            f.choices.forEach(function (c) {
+                RC_CRITERIA_FIELDS.push({
+                    name:    f.name + '___' + c.value,
+                    label:   f.label + ': ' + c.label,
+                    type:    'checkbox_option',
+                    form:    f.form,
+                    choices: [ { value: '1', label: 'Checked' }, { value: '0', label: 'Unchecked' } ]
+                });
+            });
+            return;
+        }
+        RC_CRITERIA_FIELDS.push(f);
+    });
+
+    const RC_CRITERIA_FIELD_CHOICES = {};
+    RC_CRITERIA_FIELDS.forEach(function (f) {
+        if (Array.isArray(f.choices) && f.choices.length > 0) {
+            RC_CRITERIA_FIELD_CHOICES[f.name] = f.choices;
+        }
+    });
+
     // ── Modal state ───────────────────────────────────────────────────────
     let pendingModalItem    = null;   // { index, label, active, sysId, ... } or { index: null }
     let modalCurrentSnapshot = null; // { sys_id, variables, fetched_at }
@@ -660,6 +720,7 @@ $(document).ready(function () {
     // Bootstrap modal instances
     const catalogItemModal  = new bootstrap.Modal(document.getElementById('catalog-item-modal'), { backdrop: 'static', keyboard: false });
     const deleteConfirmModal = new bootstrap.Modal(document.getElementById('delete-confirm-modal'));
+    const deleteConnectionConfirmModal = new bootstrap.Modal(document.getElementById('delete-connection-confirm-modal'));
     let fieldValuesModal    = null;
     let valueMatchModal     = null;
     let pendingValueMatchRow = null;
@@ -744,6 +805,32 @@ $(document).ready(function () {
         return '<select class="form-select form-select-sm rc-field-select">' + buildFormGroupedOptions(selectedValue) + '</select>';
     }
 
+    // Same grouping as buildFormGroupedOptions, but sourced from RC_CRITERIA_FIELDS
+    // so individual checkbox options are selectable as trigger criteria fields.
+    function buildCriteriaFieldGroupedOptions(selectedValue) {
+        const formOrder = [];
+        const byForm    = {};
+        RC_CRITERIA_FIELDS.forEach(function (f) {
+            if (!byForm[f.form]) {
+                formOrder.push(f.form);
+                byForm[f.form] = [];
+            }
+            byForm[f.form].push(f);
+        });
+        let opts = '<option value=""></option>';
+        formOrder.forEach(function (form) {
+            const formLabel = form.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+            opts += '<optgroup label="' + escHtml(formLabel) + '">';
+            byForm[form].forEach(function (f) {
+                const sel  = (f.name === selectedValue) ? ' selected' : '';
+                const text = escHtml(f.label) + ' [' + escHtml(f.name) + ']';
+                opts += '<option value="' + escHtml(f.name) + '"' + sel + '>' + text + '</option>';
+            });
+            opts += '</optgroup>';
+        });
+        return opts;
+    }
+
     // Builds <optgroup>ed <option>s for REDCap file-upload fields, used by the
     // attachments multi-select. `selected` is an array of field names.
     function buildFileFieldOptions(selected) {
@@ -774,7 +861,7 @@ $(document).ready(function () {
 
     function buildValueInput(fieldName, currentValue, hide) {
         const style   = 'max-width:200px' + (hide ? ';display:none' : '');
-        const choices = fieldName ? (RC_FIELD_CHOICES[fieldName] || null) : null;
+        const choices = fieldName ? (RC_CRITERIA_FIELD_CHOICES[fieldName] || null) : null;
         if (choices) {
             let opts = '<option value=""></option>';
             choices.forEach(function (c) {
@@ -1328,7 +1415,7 @@ $(document).ready(function () {
 
         return '<div class="d-flex align-items-center mb-2 criterion-row">' +
             '<div class="criterion-field-wrap mr-2" style="flex:0 1 280px;min-width:160px">' +
-            '<select class="form-select form-select-sm criterion-field">' + buildFormGroupedOptions(field) + '</select>' +
+            '<select class="form-select form-select-sm criterion-field">' + buildCriteriaFieldGroupedOptions(field) + '</select>' +
             '</div>' +
             '<select class="form-select form-select-sm mr-2 criterion-operator" style="max-width:175px">' + opOpts + '</select>' +
             buildValueInput(field, value, hideValue) +
@@ -1336,54 +1423,103 @@ $(document).ready(function () {
             '<i class="fas fa-times"></i></button></div>';
     }
 
+    function buildCriteriaGroup(rows) {
+        rows = (rows && rows.length > 0) ? rows : [{}];
+        let rowsHtml = '';
+        rows.forEach(function (c) { rowsHtml += buildCriterionRow(c); });
+        return '<div class="criteria-group border rounded p-2 mb-2">' +
+            '<div class="d-flex justify-content-between align-items-center mb-2">' +
+            '<small class="text-muted font-weight-bold text-uppercase">Match all of</small>' +
+            '<button class="btn btn-sm btn-link text-danger btn-remove-group p-0" type="button" title="Remove group">' +
+            '<i class="fas fa-trash-alt"></i></button></div>' +
+            '<div class="criteria-rows">' + rowsHtml + '</div>' +
+            '<button class="btn btn-sm btn-outline-secondary btn-add-condition mt-1" type="button">' +
+            '<i class="fas fa-plus mr-1"></i> Add Condition</button></div>';
+    }
+
+    // Accepts either the current OR-of-AND-groups format (array of arrays) or
+    // legacy flat criteria (array of criterion objects), always returning groups.
+    function normalizeCriteriaGroups(criteria) {
+        if (!criteria || criteria.length === 0) {
+            return [];
+        }
+        if (criteria[0] && typeof criteria[0] === 'object' && !Array.isArray(criteria[0]) && 'field' in criteria[0]) {
+            return [criteria];
+        }
+        return criteria;
+    }
+
     function renderModalCriteria(criteria) {
         const $container = $('#modal-criteria-container').empty();
-        if (!criteria || criteria.length === 0) {
+        const groups = normalizeCriteriaGroups(criteria);
+        if (groups.length === 0) {
             $('#modal-criteria-empty').show();
             return;
         }
         $('#modal-criteria-empty').hide();
 
-        const savedFields = [];
-        criteria.forEach(function (c) {
-            savedFields.push(c.field || '');
-            $container.append(buildCriterionRow(c));
-        });
+        groups.forEach(function (group, gi) {
+            if (gi > 0) {
+                $container.append('<div class="text-center text-muted small my-1 criteria-or-divider">— OR —</div>');
+            }
+            const savedFields = (group || []).map(function (c) { return c.field || ''; });
+            const $group = $(buildCriteriaGroup(group));
+            $container.append($group);
 
-        // Init Select2 on criterion field selects
-        $container.find('.criterion-field').select2({
+            $group.find('.criterion-field').select2({
+                width:          '100%',
+                placeholder:    '— Select field —',
+                allowClear:     true,
+                dropdownParent: $('#catalog-item-modal')
+            });
+
+            $group.find('.criterion-row').each(function (i) {
+                const val = savedFields[i];
+                if (val) {
+                    $(this).find('.criterion-field').val(val).trigger('change');
+                }
+            });
+        });
+    }
+
+    function collectModalCriteria() {
+        const groups = [];
+        $('#modal-criteria-container .criteria-group').each(function () {
+            const rows = [];
+            $(this).find('.criterion-row').each(function () {
+                const field    = $(this).find('.criterion-field').val();
+                const operator = $(this).find('.criterion-operator').val();
+                const value    = $(this).find('.criterion-value').val();
+                if (field) {
+                    rows.push({ field: field, operator: operator || 'eq', value: value || '' });
+                }
+            });
+            if (rows.length > 0) {
+                groups.push(rows);
+            }
+        });
+        return groups;
+    }
+
+    $('#btn-modal-add-group').on('click', function () {
+        $('#modal-criteria-empty').hide();
+        if ($('#modal-criteria-container .criteria-group').length > 0) {
+            $('#modal-criteria-container').append('<div class="text-center text-muted small my-1 criteria-or-divider">— OR —</div>');
+        }
+        const $group = $(buildCriteriaGroup([{}]));
+        $('#modal-criteria-container').append($group);
+        $group.find('.criterion-field').select2({
             width:          '100%',
             placeholder:    '— Select field —',
             allowClear:     true,
             dropdownParent: $('#catalog-item-modal')
         });
+    });
 
-        // Restore selected values (Select2 needs explicit .val().trigger('change'))
-        $container.find('.criterion-row').each(function (i) {
-            const val = savedFields[i];
-            if (val) {
-                $(this).find('.criterion-field').val(val).trigger('change');
-            }
-        });
-    }
-
-    function collectModalCriteria() {
-        const criteria = [];
-        $('#modal-criteria-container .criterion-row').each(function () {
-            const field    = $(this).find('.criterion-field').val();
-            const operator = $(this).find('.criterion-operator').val();
-            const value    = $(this).find('.criterion-value').val();
-            if (field) {
-                criteria.push({ field: field, operator: operator || 'eq', value: value || '' });
-            }
-        });
-        return criteria;
-    }
-
-    $('#btn-modal-add-criterion').on('click', function () {
-        $('#modal-criteria-empty').hide();
-        const $row = $(buildCriterionRow({}));
-        $('#modal-criteria-container').append($row);
+    $('#modal-criteria-container').on('click', '.btn-add-condition', function () {
+        const $group = $(this).closest('.criteria-group');
+        const $row   = $(buildCriterionRow({}));
+        $group.find('.criteria-rows').append($row);
         $row.find('.criterion-field').select2({
             width:          '100%',
             placeholder:    '— Select field —',
@@ -1392,11 +1528,20 @@ $(document).ready(function () {
         });
     });
 
-    $('#modal-criteria-container').on('click', '.btn-remove-criterion', function () {
-        $(this).closest('.criterion-row').remove();
-        if ($('#modal-criteria-container .criterion-row').length === 0) {
+    $('#modal-criteria-container').on('click', '.btn-remove-group', function () {
+        const $group = $(this).closest('.criteria-group');
+        const $divider = $group.prev('.criteria-or-divider').length
+            ? $group.prev('.criteria-or-divider')
+            : $group.next('.criteria-or-divider');
+        $divider.remove();
+        $group.remove();
+        if ($('#modal-criteria-container .criteria-group').length === 0) {
             $('#modal-criteria-empty').show();
         }
+    });
+
+    $('#modal-criteria-container').on('click', '.btn-remove-criterion', function () {
+        $(this).closest('.criterion-row').remove();
     });
 
     $('#modal-criteria-container').on('change', '.criterion-operator', function () {
@@ -1575,6 +1720,7 @@ $(document).ready(function () {
                     HAS_PASSWORD = true;
                     $('#sn-password').val('').attr('placeholder', 'Saved — enter to change');
                 }
+                $('#btn-delete-connection').show();
             } else {
                 showAlert('danger', 'Save failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
             }
@@ -1582,6 +1728,36 @@ $(document).ready(function () {
             showAlert('danger', 'Save request failed. Please try again.');
         }).finally(function () {
             $btn.prop('disabled', false).html('<i class="fas fa-save mr-1"></i> Save Connection Settings');
+        });
+    });
+
+    // ── Delete Connection Settings ────────────────────────────────────────
+    $('#btn-delete-connection').on('click', function () {
+        deleteConnectionConfirmModal.show();
+    });
+
+    $('#btn-confirm-delete-connection').on('click', function () {
+        const $btn = $(this).prop('disabled', true)
+                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Deleting…');
+
+        module.ajax('deleteConnectionSettings', {}).then(function (resp) {
+            if (resp.success) {
+                HAS_PASSWORD = false;
+                $('#instance-url').val('');
+                $('#sn-username').val('');
+                $('#sn-password').val('').attr('placeholder', 'Enter password').data('has-saved', '0');
+                $('#test-status').html('');
+                $('#btn-save-connection').prop('disabled', true);
+                $('#btn-delete-connection').hide();
+                deleteConnectionConfirmModal.hide();
+                showAlert('success', 'Connection settings deleted.', true);
+            } else {
+                showAlert('danger', 'Delete failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
+            }
+        }).catch(function () {
+            showAlert('danger', 'Delete request failed. Please try again.');
+        }).finally(function () {
+            $btn.prop('disabled', false).html('<i class="fas fa-trash mr-1"></i> Delete');
         });
     });
 

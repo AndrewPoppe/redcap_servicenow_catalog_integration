@@ -1,7 +1,7 @@
 {
     "name": "REDCap ServiceNow Catalog Integration",
     "namespace": "YaleREDCap\\REDCapServiceNowCatalogIntegration",
-    "description": "Integrates REDCap with a ServiceNow catalog, allowing users to submit requests directly from REDCap by mapping REDCap fields to ServiceNow catalog item fields. Tracks changes to configured catalog items and alerts users when changes are detected.",
+    "description": "Integrates REDCap with a ServiceNow catalog, allowing users to submit requests directly from REDCap by mapping REDCap fields to ServiceNow catalog item fields.",
     "documentation": "README.md",
     "authors": [
         {
@@ -116,18 +116,10 @@
             ]
         }
     ],
-    "crons": [
-        {
-            "cron_name": "check_catalog_changes",
-            "cron_description": "Checks for changes to the configured ServiceNow catalog item daily and alerts project users if changes are detected.",
-            "method": "checkCatalogChanges",
-            "cron_frequency": "86400",
-            "cron_max_run_time": "120"
-        }
-    ],
     "enable-ajax-logging": true,
     "auth-ajax-actions": [
         "deleteCatalogItem",
+        "deleteConnectionSettings",
         "getServiceNowFields",
         "getSubmissionLog",
         "saveCatalogItem",

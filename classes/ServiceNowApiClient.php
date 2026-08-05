@@ -101,7 +101,7 @@ class ServiceNowApiClient
             '/api/sn_sc/servicecatalog/items/' . $sysId . '/order_now',
             [
                 'sysparm_quantity' => (string) $quantity,
-                'variables'        => $variables,
+                'variables'        => $this->sanitizeVariables($variables),
             ]
         );
     }
@@ -189,6 +189,63 @@ class ServiceNowApiClient
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
+    /**
+     * Returns a validated copy of a RITM variable map that is safe to place in
+     * a request body.
+     *
+     * Variable names must match ServiceNow's variable-name format and values
+     * must be scalar (control characters are stripped); anything else is
+     * dropped. The request destination itself is never derived from this data:
+     * URLs are built by buildUrl() from the validated instance host, fixed API
+     * paths, and hex-sanitized sys_ids only, so the body cannot redirect the
+     * request. That makes this the sanctioned taint boundary for record values
+     * intentionally sent to ServiceNow.
+     *
+     */
+    private function sanitizeVariables(array $variables): array
+    {
+        $clean = [];
+        foreach ($variables as $name => $value) {
+            if (!is_string($name) || !preg_match('/^[a-zA-Z0-9_.\-]{1,250}$/', $name)) {
+                continue;
+            }
+            if (!is_scalar($value)) {
+                continue;
+            }
+            $clean[$name] = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', (string) $value);
+        }
+        return $clean;
+    }
+
+    /**
+     * Builds the absolute request URL from the validated instance host and a
+     * module-supplied path.
+     *
+     * The instance URL setting is parsed and only its host (and optional port)
+     * is used, so embedded credentials, paths, queries, or fragments in the
+     * setting cannot redirect requests to an unintended destination.
+     *
+     * @return string|null Null when the instance URL is not a valid https URL.
+     */
+    private function buildUrl(string $path): ?string
+    {
+        $parts = parse_url($this->instanceUrl);
+        if ($parts === false
+            || ($parts['scheme'] ?? '') !== 'https'
+            || empty($parts['host'])
+            || isset($parts['user']) || isset($parts['pass'])
+            || !preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$/', $parts['host'])
+        ) {
+            return null;
+        }
+
+        $url = 'https://' . $parts['host'];
+        if (isset($parts['port'])) {
+            $url .= ':' . (int) $parts['port'];
+        }
+        return $url . $path;
+    }
+
     private function get(string $path): array
     {
         return $this->request('GET', $path);
@@ -213,13 +270,14 @@ class ServiceNowApiClient
             return ['success' => false, 'error' => 'cURL is not available on this server.'];
         }
 
-        if (!preg_match('#^https://#i', $this->instanceUrl)) {
-            return ['success' => false, 'error' => 'Instance URL must use HTTPS (https://).'];
+        $url = $this->buildUrl($path);
+        if ($url === null) {
+            return ['success' => false, 'error' => 'Instance URL must be a valid https:// URL.'];
         }
 
         $ch = curl_init();
         curl_setopt_array($ch, [
-            CURLOPT_URL            => $this->instanceUrl . $path,
+            CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_HTTPHEADER     => [
@@ -239,7 +297,7 @@ class ServiceNowApiClient
         $response = curl_exec($ch);
         $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr  = curl_error($ch);
-        curl_close($ch);
+        unset($ch);
 
         if ($curlErr !== '') {
             return ['success' => false, 'error' => 'Connection failed: ' . $curlErr];
@@ -279,13 +337,14 @@ class ServiceNowApiClient
             return ['success' => false, 'error' => 'cURL is not available on this server.'];
         }
 
-        if (!preg_match('#^https://#i', $this->instanceUrl)) {
-            return ['success' => false, 'error' => 'Instance URL must use HTTPS (https://).'];
+        $url = $this->buildUrl($path);
+        if ($url === null) {
+            return ['success' => false, 'error' => 'Instance URL must be a valid https:// URL.'];
         }
 
         $ch = curl_init();
         curl_setopt_array($ch, [
-            CURLOPT_URL            => $this->instanceUrl . $path,
+            CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_HTTPHEADER     => [
@@ -302,7 +361,7 @@ class ServiceNowApiClient
         $response = curl_exec($ch);
         $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr  = curl_error($ch);
-        curl_close($ch);
+        unset($ch);
 
         if ($curlErr !== '') {
             return ['success' => false, 'error' => 'Connection failed: ' . $curlErr];
