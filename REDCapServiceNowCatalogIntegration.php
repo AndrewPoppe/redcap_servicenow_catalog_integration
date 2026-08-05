@@ -215,6 +215,10 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     }
 
     public function redcap_module_ajax($action, $payload, $project_id, $record, $instrument, $event_id, $repeat_instance, $survey_hash, $response_id, $survey_queue_hash, $page, $page_full, $user_id, $group_id)  {
+        if (!$this->framework->isSuperUser()) {
+            return ['success' => false, 'error' => 'Unauthorized: only super users can perform this action.'];
+        }
+    
         switch ($action) {
             case 'testConnection':
                 return $this->testConnection($payload);
