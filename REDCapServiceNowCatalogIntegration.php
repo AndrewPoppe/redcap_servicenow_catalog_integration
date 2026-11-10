@@ -337,6 +337,22 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     }
 
     /**
+     * Project setting keys that make up one catalog item. Each key holds a
+     * parallel array indexed by catalog item position.
+     */
+    private const CATALOG_ITEM_SETTING_KEYS = [
+        'catalog-item-label',
+        'catalog-item-active',
+        'catalog-item-sys-id',
+        'catalog-item-field-mappings',
+        'catalog-item-value-mappings',
+        'catalog-item-attachment-fields',
+        'catalog-item-snapshot',
+        'catalog-item-trigger-form',
+        'catalog-item-trigger-criteria',
+    ];
+
+    /**
      * Returns all configured catalog items as an array of associative arrays.
      * Each element has: label, active, sysId, fieldMappings, valueMappings, snapshot, triggerForm, criteria.
      */
@@ -368,6 +384,24 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             ];
         }
         return $items;
+    }
+
+    /**
+     * Returns a catalog-item settings array re-indexed as a 0..$count-1 list.
+     *
+     * Settings added in later module versions have no entries for catalog
+     * items created before them, so writing a single index can leave a sparse
+     * array (stored as a JSON object). Padding keeps every parallel array
+     * aligned with the label array so positional operations such as
+     * array_splice() hit the intended item.
+     */
+    private function normalizeSettingArray(array $values, int $count, $default = null): array
+    {
+        $list = [];
+        for ($i = 0; $i < $count; $i++) {
+            $list[] = array_key_exists($i, $values) ? $values[$i] : $default;
+        }
+        return $list;
     }
 
     private function decodeProjectSettingJson($value, $default)
@@ -410,40 +444,33 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         }
 
         // Read existing parallel arrays
-        $labels    = (array) ($this->framework->getProjectSetting('catalog-item-label')            ?? []);
-        $actives   = (array) ($this->framework->getProjectSetting('catalog-item-active')           ?? []);
-        $sysIds    = (array) ($this->framework->getProjectSetting('catalog-item-sys-id')           ?? []);
-        $mapsArr   = (array) ($this->framework->getProjectSetting('catalog-item-field-mappings')   ?? []);
-        $valMapsArr = (array) ($this->framework->getProjectSetting('catalog-item-value-mappings')  ?? []);
-        $attachArr = (array) ($this->framework->getProjectSetting('catalog-item-attachment-fields') ?? []);
-        $snapsArr  = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
-        $formsArr  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
-        $critArr   = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
+        $labels = (array) ($this->framework->getProjectSetting('catalog-item-label') ?? []);
+        $count  = count($labels);
 
         // Append for new items
-        if ($index === null) {
-            $index = count($labels);
+        if ($index === null || $index < 0 || $index > $count) {
+            $index = $count;
         }
+        $count = max($count, $index + 1);
 
-        $labels[$index]   = $label;
-        $actives[$index]  = $active ? '1' : '0';
-        $sysIds[$index]   = $sysId;
-        $mapsArr[$index]  = json_encode(is_array($fieldMappings) ? $fieldMappings : []);
-        $valMapsArr[$index] = json_encode(is_array($valueMappings) ? $valueMappings : []);
-        $attachArr[$index] = json_encode(is_array($attachFields) ? array_values($attachFields) : []);
-        $snapsArr[$index] = $snapshot !== null ? json_encode($snapshot) : null;
-        $formsArr[$index] = $triggerForm;
-        $critArr[$index]  = json_encode(is_array($criteria) ? $criteria : []);
+        $values = [
+            'catalog-item-label'             => $label,
+            'catalog-item-active'            => $active ? '1' : '0',
+            'catalog-item-sys-id'            => $sysId,
+            'catalog-item-field-mappings'    => json_encode(is_array($fieldMappings) ? $fieldMappings : []),
+            'catalog-item-value-mappings'    => json_encode(is_array($valueMappings) ? $valueMappings : []),
+            'catalog-item-attachment-fields' => json_encode(is_array($attachFields) ? array_values($attachFields) : []),
+            'catalog-item-snapshot'          => $snapshot !== null ? json_encode($snapshot) : null,
+            'catalog-item-trigger-form'      => $triggerForm,
+            'catalog-item-trigger-criteria'  => json_encode(is_array($criteria) ? $criteria : []),
+        ];
 
-        $this->framework->setProjectSetting('catalog-item-label',              $labels);
-        $this->framework->setProjectSetting('catalog-item-active',             $actives);
-        $this->framework->setProjectSetting('catalog-item-sys-id',             $sysIds);
-        $this->framework->setProjectSetting('catalog-item-field-mappings',     $mapsArr);
-        $this->framework->setProjectSetting('catalog-item-value-mappings',     $valMapsArr);
-        $this->framework->setProjectSetting('catalog-item-attachment-fields',  $attachArr);
-        $this->framework->setProjectSetting('catalog-item-snapshot',           $snapsArr);
-        $this->framework->setProjectSetting('catalog-item-trigger-form',       $formsArr);
-        $this->framework->setProjectSetting('catalog-item-trigger-criteria',   $critArr);
+        foreach ($values as $key => $value) {
+            $existing = (array) ($this->framework->getProjectSetting($key) ?? []);
+            $list     = $this->normalizeSettingArray($existing, $count);
+            $list[$index] = $value;
+            $this->framework->setProjectSetting($key, $list);
+        }
 
         return ['success' => true, 'index' => $index];
     }
@@ -451,26 +478,15 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     private function deleteCatalogItem(array $payload): array
     {
         $index = isset($payload['index']) ? (int) $payload['index'] : -1;
-        if ($index < 0) {
+        $count = count((array) ($this->framework->getProjectSetting('catalog-item-label') ?? []));
+        if ($index < 0 || $index >= $count) {
             return ['success' => false, 'error' => 'Invalid index.'];
         }
 
-        $keys = [
-            'catalog-item-label',
-            'catalog-item-active',
-            'catalog-item-sys-id',
-            'catalog-item-field-mappings',
-            'catalog-item-value-mappings',
-            'catalog-item-attachment-fields',
-            'catalog-item-snapshot',
-            'catalog-item-trigger-form',
-            'catalog-item-trigger-criteria',
-        ];
-
-        foreach ($keys as $key) {
-            $values = (array) ($this->framework->getProjectSetting($key) ?? []);
+        foreach (self::CATALOG_ITEM_SETTING_KEYS as $key) {
+            $values = $this->normalizeSettingArray((array) ($this->framework->getProjectSetting($key) ?? []), $count);
             array_splice($values, $index, 1);
-            $this->framework->setProjectSetting($key, array_values($values));
+            $this->framework->setProjectSetting($key, $values);
         }
 
         return ['success' => true];
