@@ -178,6 +178,8 @@ foreach ($redcapForms as $form) {
         border-radius: 3px;
     }
     .btn-match-values { white-space: nowrap; }
+    #submission-log-table td.sn-log-reason { min-width: 240px; white-space: normal; word-break: break-word; }
+    #submission-log-table .sn-log-status { white-space: nowrap; }
     .value-map-badge {
         font-size: 0.7em;
         font-weight: 600;
@@ -363,17 +365,30 @@ foreach ($redcapForms as $form) {
                 </button>
             </div>
             <div class="card-body">
-                <p class="text-muted small">
-                    Every successful ServiceNow request item (RITM) submission is recorded below.
-                </p>
+                <div class="d-flex justify-content-between align-items-center flex-wrap mb-2" style="gap:0.5rem">
+                    <p class="text-muted small mb-0">
+                        Every ServiceNow request item (RITM) submission attempt is recorded below, including failed
+                        submissions and attachment uploads that failed, with the reason for each failure.
+                    </p>
+                    <div class="d-flex align-items-center" style="gap:0.5rem">
+                        <label for="log-status-filter" class="small text-muted mb-0 text-nowrap">Show:</label>
+                        <select id="log-status-filter" class="form-select form-select-sm" style="width:auto">
+                            <option value="all">All submissions</option>
+                            <option value="success">Successful only</option>
+                            <option value="failed">Failures only</option>
+                        </select>
+                    </div>
+                </div>
                 <table id="submission-log-table" class="hover w-100">
                     <thead>
                         <tr>
                             <th>Timestamp</th>
+                            <th>Status</th>
                             <th>Record</th>
                             <th>Catalog Item</th>
                             <th>Trigger Form</th>
                             <th>Request Number</th>
+                            <th>Failure Reason</th>
                         </tr>
                     </thead>
                     <tbody></tbody>
@@ -499,7 +514,7 @@ foreach ($redcapForms as $form) {
                 </div>
 
                 <!-- Trigger Settings -->
-                <div class="card shadow-sm mb-2">
+                <div class="card shadow-sm mb-4">
                     <div class="card-header">
                         <i class="fas fa-bolt mr-1"></i> Trigger Settings
                     </div>
@@ -542,6 +557,30 @@ foreach ($redcapForms as $form) {
                             No criteria — the push will fire on every save of the trigger form.
                         </p>
 
+                    </div>
+                </div>
+
+                <!-- Failure Notifications -->
+                <div class="card shadow-sm mb-2">
+                    <div class="card-header">
+                        <i class="fas fa-bell mr-1"></i> Failure Notifications
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group mb-0">
+                            <label for="modal-failure-emails" class="font-weight-bold">
+                                Notification Email Addresses
+                                <small class="font-weight-normal text-muted ml-1">(optional)</small>
+                            </label>
+                            <textarea class="form-control" id="modal-failure-emails" rows="2"
+                                      style="max-width:540px"
+                                      placeholder="e.g. redcap-admin@example.edu, servicedesk@example.edu"></textarea>
+                            <small class="form-text text-muted">
+                                Each address receives an email when a submission for this catalog item fails, or when
+                                the request is created but a file cannot be attached. The email includes the record ID
+                                and the failure reason, but no other record data. Separate multiple addresses with
+                                commas, semicolons, or new lines. Leave blank to turn off notifications.
+                            </small>
+                        </div>
                     </div>
                 </div>
 
@@ -1106,6 +1145,7 @@ $(document).ready(function () {
             $('#modal-item-label').val(item.label || '');
             $('#modal-item-active').prop('checked', !!item.active);
             $('#modal-item-sys-id').val(item.sysId || '');
+            $('#modal-failure-emails').val(Array.isArray(item.failureEmails) ? item.failureEmails.join(', ') : '');
         } else {
             pendingModalItem = { index: null };
             $('#catalog-item-modal-title').text('Add Catalog Item');
@@ -1128,6 +1168,7 @@ $(document).ready(function () {
         $('#modal-mapping-tbody').empty();
         $('#modal-mapping-count').hide().text('');
         $('#modal-attachment-fields').empty().val(null);
+        $('#modal-failure-emails').val('');
         $('#modal-criteria-container').empty();
         $('#modal-criteria-empty').show();
         modalCurrentSnapshot = null;
@@ -1557,6 +1598,25 @@ $(document).ready(function () {
         $row.find('.criterion-value').replaceWith($(buildValueInput(fieldName, '', hideValue)));
     });
 
+    // ── Failure notification emails ───────────────────────────────────────
+    // Splits the textarea on commas, semicolons, and whitespace and removes
+    // case-insensitive duplicates. The server re-validates every address.
+    function parseEmailList(text) {
+        const seen   = {};
+        const emails = [];
+        String(text || '').split(/[\s,;]+/).forEach(function (part) {
+            const email = part.trim();
+            if (!email || seen[email.toLowerCase()]) return;
+            seen[email.toLowerCase()] = true;
+            emails.push(email);
+        });
+        return emails;
+    }
+
+    function isValidEmail(email) {
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
+
     // ── Save Catalog Item ─────────────────────────────────────────────────
     $('#btn-modal-save').on('click', function () {
         const label       = $('#modal-item-label').val().trim();
@@ -1584,6 +1644,15 @@ $(document).ready(function () {
             }
         }
 
+        const failureEmails = parseEmailList($('#modal-failure-emails').val());
+        const invalidEmails = failureEmails.filter(function (e) { return !isValidEmail(e); });
+        if (invalidEmails.length > 0) {
+            showAlert('warning',
+                'Please correct the following failure notification email address(es): ' +
+                '<strong>' + invalidEmails.map(escHtml).join(', ') + '</strong>.');
+            return;
+        }
+
         const fieldMappings = collectMappings();
         const valueMappings = collectValueMappings();
         const criteria      = collectModalCriteria();
@@ -1603,7 +1672,8 @@ $(document).ready(function () {
             attachmentFields: attachmentFields,
             triggerForm:   triggerForm,
             criteria:      criteria,
-            snapshot:      modalCurrentSnapshot
+            snapshot:      modalCurrentSnapshot,
+            failureEmails: failureEmails
         }).then(function (resp) {
             if (resp.success) {
                 const newItem = {
@@ -1615,7 +1685,8 @@ $(document).ready(function () {
                     attachmentFields: attachmentFields,
                     triggerForm:   triggerForm,
                     criteria:      criteria,
-                    snapshot:      modalCurrentSnapshot
+                    snapshot:      modalCurrentSnapshot,
+                    failureEmails: Array.isArray(resp.failureEmails) ? resp.failureEmails : failureEmails
                 };
                 CATALOG_ITEMS[resp.index] = newItem;
                 renderCatalogItemsTable();
@@ -1782,6 +1853,18 @@ $(document).ready(function () {
         return RC_FORMS.get(name) || name || '—';
     }
 
+    const LOG_STATUS_BADGES = {
+        success:           { cls: 'bg-success',          icon: 'check-circle',         text: 'Success' },
+        failed:            { cls: 'bg-danger',           icon: 'times-circle',         text: 'Failed' },
+        attachment_failed: { cls: 'bg-warning text-dark', icon: 'exclamation-triangle', text: 'Attachment Failed' }
+    };
+
+    function buildStatusBadge(status) {
+        const b = LOG_STATUS_BADGES[status] || LOG_STATUS_BADGES.failed;
+        return '<span class="badge sn-log-status ' + b.cls + '"><i class="fas fa-' + b.icon + ' me-1"></i>' +
+               escHtml(b.text) + '</span>';
+    }
+
     function initSubmissionLogTable() {
         if (submissionLogTable) {
             return;
@@ -1794,6 +1877,7 @@ $(document).ready(function () {
             pageLength:  25,
             lengthMenu:  [[10, 25, 50, 100], [10, 25, 50, 100]],
             ajax: function (data, callback) {
+                data.status = $('#log-status-filter').val() || 'all';
                 module.ajax('getSubmissionLog', data).then(function (json) {
                     callback(json);
                 }).catch(function () {
@@ -1803,6 +1887,7 @@ $(document).ready(function () {
             },
             columns: [
                 { data: 'timestamp',     render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
+                { data: 'status',        render: function (d, type) { return type === 'display' ? buildStatusBadge(d) : (d || ''); } },
                 { data: 'record',        render: function (d, type) { return type === 'display' ? buildRecordLink(d) : (d || ''); } },
                 { data: 'catalog_label', render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
                 { data: 'instrument',    render: function (d, type) { return type === 'display' ? escHtml(formLabelFor(d)) : (d || ''); } },
@@ -1813,6 +1898,10 @@ $(document).ready(function () {
                         return '<a href="' + escHtml(row.request_url) + '" target="_blank" rel="noopener">' + escHtml(d) + '</a>';
                     }
                     return escHtml(d);
+                } },
+                { data: 'reason', orderable: false, className: 'sn-log-reason', render: function (d, type) {
+                    if (type !== 'display') { return d || ''; }
+                    return d ? '<small>' + escHtml(d) + '</small>' : '';
                 } }
             ],
             language: {
@@ -1821,6 +1910,12 @@ $(document).ready(function () {
             }
         });
     }
+
+    $('#log-status-filter').on('change', function () {
+        if (submissionLogTable) {
+            submissionLogTable.ajax.reload();
+        }
+    });
 
     // Build the table the first time the Submission Log tab is opened; on later
     // visits just re-adjust column widths (DataTables miscalculates while hidden).
@@ -1837,6 +1932,11 @@ $(document).ready(function () {
             submissionLogTable.ajax.reload(null, false);
         }
     });
+
+    // Failure notification emails link to "#submission-log"; open that tab.
+    if (window.location.hash === '#submission-log') {
+        bootstrap.Tab.getOrCreateInstance(document.getElementById('tab-log-btn')).show();
+    }
 
 });
 </script>

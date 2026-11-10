@@ -172,33 +172,51 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'error'       => $result['error']                  ?? null,
             ]);
 
+            $logContext = [
+                'record'        => $record,
+                'event_id'      => $event_id,
+                'instrument'    => $instrument,
+                'instance'      => $repeat_instance,
+                'catalog_label' => $item['label'] ?? '',
+            ];
+            $requestNumber = isset($result['data']['request_number']) ? (string) $result['data']['request_number'] : null;
+            $requestId     = isset($result['data']['request_id'])     ? (string) $result['data']['request_id']     : null;
+
             $this->framework->log(
-                'ServiceNow RITM submission ' . ($result['success'] ? 'succeeded' : 'failed'),
-                [
-                    'record'        => $record,
-                    'event_id'      => $event_id,
-                    'instrument'    => $instrument,
-                    'instance'      => $repeat_instance,
-                    'catalog_label' => $item['label'] ?? '',
-                    'http_code'     => $result['httpCode']               ?? null,
-                    'request_number'   => $result['data']['request_number'] ?? null,
-                    'request_id'    => $result['data']['request_id'] ?? null,
-                    'error'         => $result['error']                  ?? null,
-                ]
+                $result['success'] ? self::RITM_SUCCESS_MESSAGE : self::RITM_FAILURE_MESSAGE,
+                array_merge($logContext, [
+                    'http_code'      => $result['httpCode'] ?? null,
+                    'request_number' => $requestNumber,
+                    'request_id'     => $requestId,
+                    'error'          => $result['success'] ? null : (string) ($result['error'] ?? 'Unknown error.'),
+                ])
             );
+
+            if (!$result['success']) {
+                $this->sendFailureNotification($item, $logContext, false, [
+                    $this->formatFailureReason($result['error'] ?? null, $result['httpCode'] ?? null),
+                ]);
+                continue;
+            }
 
             // Upload any mapped file-upload fields as RITM attachments. Files
             // cannot be sent through order_now, so this runs as a follow-up step
             // only when the RITM was created successfully.
             $attachmentFields = array_values(array_filter((array) ($item['attachmentFields'] ?? [])));
-            if ($result['success'] && !empty($attachmentFields)) {
-                $requestId = (string) ($result['data']['request_id'] ?? '');
-                $this->processAttachments($attachmentFields, $recordData, $requestId, $itemLabel, [
-                    'record'     => $record,
-                    'event_id'   => $event_id,
-                    'instrument' => $instrument,
-                    'instance'   => $repeat_instance,
-                ]);
+            if (!empty($attachmentFields)) {
+                $attachmentFailures = $this->processAttachments(
+                    $attachmentFields,
+                    $recordData,
+                    (string) $requestId,
+                    $itemLabel,
+                    array_merge($logContext, [
+                        'request_number' => $requestNumber,
+                        'request_id'     => $requestId,
+                    ])
+                );
+                if (!empty($attachmentFailures)) {
+                    $this->sendFailureNotification($item, $logContext, true, $attachmentFailures, $requestNumber);
+                }
             }
         }
 
@@ -237,13 +255,33 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     /** Log message written for a successful RITM submission. */
     private const RITM_SUCCESS_MESSAGE = 'ServiceNow RITM submission succeeded';
 
+    /** Log message written when ServiceNow rejects (or never receives) a RITM submission. */
+    private const RITM_FAILURE_MESSAGE = 'ServiceNow RITM submission failed';
+
+    /** Log message written when a RITM was created but a file could not be attached to it. */
+    private const ATTACHMENT_FAILURE_MESSAGE = 'ServiceNow attachment upload failed';
+
+    /** Log message written when a failure notification email could not be sent. */
+    private const NOTIFICATION_FAILURE_MESSAGE = 'ServiceNow failure notification could not be sent';
+
+    /** Log messages shown in the Submission Log, keyed by the status reported to the UI. */
+    private const SUBMISSION_LOG_STATUSES = [
+        'success'           => self::RITM_SUCCESS_MESSAGE,
+        'failed'            => self::RITM_FAILURE_MESSAGE,
+        'attachment_failed' => self::ATTACHMENT_FAILURE_MESSAGE,
+    ];
+
     /**
      * Server-side DataTables endpoint for the RITM submission log.
      *
      * Reads the standard DataTables request parameters (draw, start, length,
-     * search, order) and returns only the requested page of rows so the table
-     * stays performant no matter how large the log grows. All filtering,
-     * ordering and pagination are pushed down to the database via queryLogs().
+     * search, order) plus an optional `status` filter (all|success|failed) and
+     * returns only the requested page of rows so the table stays performant no
+     * matter how large the log grows. All filtering, ordering and pagination
+     * are pushed down to the database via queryLogs().
+     *
+     * Successful submissions, failed submissions, and attachment upload
+     * failures (RITM created, file not attached) are all included.
      *
      * @param array $payload DataTables server-side request parameters.
      * @return array DataTables server-side response (draw/recordsTotal/recordsFiltered/data).
@@ -259,8 +297,9 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             $length = 100;
         }
 
-        // Columns exposed to DataTables, in display order. Index → sortable log field.
-        $sortFields = ['timestamp', 'record', 'catalog_label', 'instrument', 'request_number'];
+        // Columns exposed to DataTables, in display order. Index → sortable log
+        // field (null = not sortable; falls back to timestamp).
+        $sortFields = ['timestamp', 'message', 'record', 'catalog_label', 'instrument', 'request_number', null];
 
         $orderColIdx = isset($payload['order'][0]['column']) ? (int) $payload['order'][0]['column'] : 0;
         $orderDir    = (strtolower((string) ($payload['order'][0]['dir'] ?? 'desc')) === 'asc') ? 'asc' : 'desc';
@@ -268,11 +307,22 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
 
         $searchValue = trim((string) ($payload['search']['value'] ?? ''));
 
-        // ── Unfiltered total ──────────────────────────────────────────────
-        $recordsTotal = (int) $this->framework->countLogs('message = ?', [self::RITM_SUCCESS_MESSAGE]);
+        $allMessages = array_values(self::SUBMISSION_LOG_STATUSES);
+        switch ((string) ($payload['status'] ?? 'all')) {
+            case 'success':
+                $statusMessages = [self::RITM_SUCCESS_MESSAGE];
+                break;
+            case 'failed':
+                $statusMessages = [self::RITM_FAILURE_MESSAGE, self::ATTACHMENT_FAILURE_MESSAGE];
+                break;
+            default:
+                $statusMessages = $allMessages;
+        }
+        $isFiltered = ($searchValue !== '' || count($statusMessages) !== count($allMessages));
 
-        // No submissions logged yet — the custom log parameters referenced below
-        // do not exist, so queryLogs() would throw. Return an empty page instead.
+        // ── Unfiltered total ──────────────────────────────────────────────
+        $recordsTotal = (int) $this->framework->countLogs($this->buildInClause('message', $allMessages), $allMessages);
+
         if ($recordsTotal === 0) {
             return [
                 'draw'            => $draw,
@@ -283,48 +333,61 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         }
 
         // ── Build the filtered WHERE clause ───────────────────────────────
-        $where  = 'message = ?';
-        $params = [self::RITM_SUCCESS_MESSAGE];
+        $where  = $this->buildInClause('message', $statusMessages);
+        $params = $statusMessages;
 
         if ($searchValue !== '') {
             $like = '%' . $searchValue . '%';
-            $where .= ' and (record like ? or catalog_label like ? or instrument like ? or request_number like ?)';
-            array_push($params, $like, $like, $like, $like);
+            $where .= ' and (record like ? or catalog_label like ? or instrument like ? or request_number like ? or error like ? or file_name like ?)';
+            array_push($params, $like, $like, $like, $like, $like, $like);
         }
 
         // ── Filtered total ────────────────────────────────────────────────
-        $recordsFiltered = ($searchValue === '')
-            ? $recordsTotal
-            : (int) $this->framework->countLogs($where, $params);
+        $recordsFiltered = $isFiltered
+            ? (int) $this->framework->countLogs($where, $params)
+            : $recordsTotal;
 
         // ── Page of rows ──────────────────────────────────────────────────
         // LIMIT values must be integer literals for queryLogs; the casts above
         // guarantee they are safe to inline.
-        $sql = "select timestamp, record, instrument, catalog_label, request_number, request_id"
+        $sql = "select timestamp, message, record, instrument, catalog_label, request_number, request_id,"
+             . " http_code, error, field, file_name"
              . " where $where"
              . " order by $orderField $orderDir, log_id $orderDir"
              . " limit " . (int) $start . ", " . (int) $length;
 
         $instanceUrl = rtrim((string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? ''), '/');
+        $statusByMessage = array_flip(self::SUBMISSION_LOG_STATUSES);
 
         $data   = [];
         $result = $this->framework->queryLogs($sql, $params);
         while ($row = $result->fetch_assoc()) {
             $requestId = $row['request_id'] ?? null;
+            $status    = $statusByMessage[$row['message']] ?? 'failed';
+
+            $reason = null;
+            if ($status === 'failed') {
+                $reason = $this->formatFailureReason($row['error'] ?? null, $row['http_code'] ?? null);
+            } elseif ($status === 'attachment_failed') {
+                $reason = $this->formatAttachmentFailureReason(
+                    $row['file_name'] ?? null,
+                    $row['field'] ?? null,
+                    $row['error'] ?? null,
+                    $row['http_code'] ?? null
+                );
+            }
+
             $data[] = [
-                // 'log_id'        => $row['log_id'],
-                'timestamp'     => $row['timestamp'],
-                // 'username'      => $row['username'],
-                'record'        => $row['record'],
-                // 'event_id'      => $row['event_id'],
-                'instrument'    => $row['instrument'],
-                // 'instance'      => $row['instance'],
-                'catalog_label' => $row['catalog_label'],
-                'request_number'   => $row['request_number'] ?? null,
-                'request_url'   => ($instanceUrl !== '' && !empty($requestId))
+                'timestamp'      => $row['timestamp'],
+                'status'         => $status,
+                'record'         => $row['record'],
+                'instrument'     => $row['instrument'],
+                'catalog_label'  => $row['catalog_label'],
+                'request_number' => $row['request_number'] ?? null,
+                'request_url'    => ($instanceUrl !== '' && !empty($requestId))
                     ? $instanceUrl . '/now/nav/ui/classic/params/target/' . rawurlencode('sc_request.do?sys_id=' . $requestId)
                     : null,
-                // 'http_code'     => $row['http_code'],
+                'reason'         => $reason,
             ];
         }
 
@@ -350,11 +413,13 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         'catalog-item-snapshot',
         'catalog-item-trigger-form',
         'catalog-item-trigger-criteria',
+        'catalog-item-failure-emails',
     ];
 
     /**
      * Returns all configured catalog items as an array of associative arrays.
-     * Each element has: label, active, sysId, fieldMappings, valueMappings, snapshot, triggerForm, criteria.
+     * Each element has: label, active, sysId, fieldMappings, valueMappings,
+     * attachmentFields, snapshot, triggerForm, criteria, failureEmails.
      */
     public function getCatalogItems(): array
     {
@@ -367,6 +432,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $snapshots = (array) ($this->framework->getProjectSetting('catalog-item-snapshot')         ?? []);
         $forms     = (array) ($this->framework->getProjectSetting('catalog-item-trigger-form')     ?? []);
         $criteria  = (array) ($this->framework->getProjectSetting('catalog-item-trigger-criteria') ?? []);
+        $emails    = (array) ($this->framework->getProjectSetting('catalog-item-failure-emails')   ?? []);
 
         $count = count($labels);
         $items = [];
@@ -381,6 +447,10 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'snapshot'         => $this->decodeProjectSettingJson($snapshots[$i] ?? null, null),
                 'triggerForm'      => (string) ($forms[$i] ?? ''),
                 'criteria'         => $this->decodeProjectSettingJson($criteria[$i] ?? [], []),
+                'failureEmails'    => array_values(array_filter(
+                    (array) $this->decodeProjectSettingJson($emails[$i] ?? [], []),
+                    'is_string'
+                )),
             ];
         }
         return $items;
@@ -402,6 +472,39 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             $list[] = array_key_exists($i, $values) ? $values[$i] : $default;
         }
         return $list;
+    }
+
+    /**
+     * Parses a list of email addresses supplied as an array or as a string
+     * separated by commas, semicolons, or whitespace.
+     *
+     * @return array{valid: string[], invalid: string[]} De-duplicated (case-insensitively) valid addresses, plus any rejected entries.
+     */
+    private function parseEmailList($input): array
+    {
+        if (is_array($input)) {
+            $input = implode(',', array_filter($input, 'is_scalar'));
+        }
+        $parts = is_scalar($input)
+            ? preg_split('/[\s,;]+/', (string) $input, -1, PREG_SPLIT_NO_EMPTY)
+            : [];
+
+        $valid   = [];
+        $invalid = [];
+        $seen    = [];
+        foreach ((array) $parts as $email) {
+            if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+                $invalid[] = $email;
+                continue;
+            }
+            $key = strtolower($email);
+            if (!isset($seen[$key])) {
+                $seen[$key] = true;
+                $valid[]    = $email;
+            }
+        }
+
+        return ['valid' => $valid, 'invalid' => $invalid];
     }
 
     private function decodeProjectSettingJson($value, $default)
@@ -435,12 +538,19 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         $triggerForm   = $payload['triggerForm']      ?? '';
         $criteria      = $payload['criteria']         ?? [];
         $snapshot      = $payload['snapshot']         ?? null;
+        $emailList     = $this->parseEmailList($payload['failureEmails'] ?? []);
 
         if ($label === '') {
             return ['success' => false, 'error' => 'Label is required.'];
         }
         if ($sysId === '') {
             return ['success' => false, 'error' => 'Catalog Item sys_id is required.'];
+        }
+        if (!empty($emailList['invalid'])) {
+            return [
+                'success' => false,
+                'error'   => 'Invalid failure notification email address(es): ' . implode(', ', $emailList['invalid']),
+            ];
         }
 
         // Read existing parallel arrays
@@ -463,6 +573,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             'catalog-item-snapshot'          => $snapshot !== null ? json_encode($snapshot) : null,
             'catalog-item-trigger-form'      => $triggerForm,
             'catalog-item-trigger-criteria'  => json_encode(is_array($criteria) ? $criteria : []),
+            'catalog-item-failure-emails'    => json_encode($emailList['valid']),
         ];
 
         foreach ($values as $key => $value) {
@@ -472,7 +583,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
             $this->framework->setProjectSetting($key, $list);
         }
 
-        return ['success' => true, 'index' => $index];
+        return ['success' => true, 'index' => $index, 'failureEmails' => $emailList['valid']];
     }
 
     private function deleteCatalogItem(array $payload): array
@@ -557,6 +668,7 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
      * @param string   $requestId        order_now `request_id` (sc_request sys_id).
      * @param string   $itemLabel        Catalog item label, for debug output.
      * @param array    $logContext       Extra context merged into the audit log.
+     * @return string[] Human-readable description of each attachment failure (empty when all succeeded).
      */
     private function processAttachments(
         array $attachmentFields,
@@ -564,11 +676,8 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         string $requestId,
         string $itemLabel,
         array $logContext = []
-    ): void {
-        if ($requestId === '') {
-            $this->debug("[$itemLabel] Cannot upload attachments — missing request_id");
-            return;
-        }
+    ): array {
+        $failures = [];
 
         // Collect fields that actually hold an uploaded file (an edoc id).
         $pendingFields = [];
@@ -580,36 +689,52 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         }
         if (empty($pendingFields)) {
             $this->debug("[$itemLabel] No uploaded files found for configured attachment fields — skipping");
-            return;
+            return $failures;
+        }
+
+        if ($requestId === '') {
+            $error = 'ServiceNow did not return a request ID, so files could not be attached.';
+            $this->debug("[$itemLabel] Cannot upload attachments — missing request_id");
+            $this->framework->log(self::ATTACHMENT_FAILURE_MESSAGE, array_merge($logContext, [
+                'catalog_label' => $itemLabel,
+                'error'         => $error,
+            ]));
+            $failures[] = $this->formatAttachmentFailureReason(null, null, $error, null);
+            return $failures;
         }
 
         // Resolve the RITM sys_id once (all files attach to the same RITM).
         $client = $this->getApiClient();
         $ritm   = $client->getRequestItemSysId($requestId);
         if (!($ritm['success'] ?? false)) {
+            $error = 'Could not resolve request item: ' . ($ritm['error'] ?? 'unknown error');
             $this->debug("[$itemLabel] Could not resolve RITM sys_id for attachments", [
                 'request_id' => $requestId,
                 'error'      => $ritm['error'] ?? null,
             ]);
-            $this->framework->log('ServiceNow attachment upload failed', array_merge($logContext, [
+            $this->framework->log(self::ATTACHMENT_FAILURE_MESSAGE, array_merge($logContext, [
                 'catalog_label' => $itemLabel,
-                'error'         => 'Could not resolve request item: ' . ($ritm['error'] ?? 'unknown error'),
+                'http_code'     => $ritm['httpCode'] ?? null,
+                'error'         => $error,
             ]));
-            return;
+            $failures[] = $this->formatAttachmentFailureReason(null, null, $error, $ritm['httpCode'] ?? null);
+            return $failures;
         }
         $ritmSysId = (string) $ritm['sysId'];
 
         foreach ($pendingFields as $field => $edocId) {
             $contents = \REDCap::getFile($edocId);
             if (!is_array($contents) || count($contents) < 3) {
+                $error = 'Could not read uploaded file (edoc ' . $edocId . ').';
                 $this->debug("[$itemLabel] Could not read file contents for field '$field'", [
                     'edoc_id' => $edocId,
                 ]);
-                $this->framework->log('ServiceNow attachment upload failed', array_merge($logContext, [
+                $this->framework->log(self::ATTACHMENT_FAILURE_MESSAGE, array_merge($logContext, [
                     'catalog_label' => $itemLabel,
                     'field'         => $field,
-                    'error'         => 'Could not read uploaded file (edoc ' . $edocId . ').',
+                    'error'         => $error,
                 ]));
+                $failures[] = $this->formatAttachmentFailureReason(null, $field, $error, null);
                 continue;
             }
 
@@ -629,18 +754,232 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
                 'error'     => $upload['error'] ?? null,
             ]);
 
+            $uploaded = (bool) ($upload['success'] ?? false);
             $this->framework->log(
-                'ServiceNow attachment upload ' . (($upload['success'] ?? false) ? 'succeeded' : 'failed'),
+                $uploaded ? 'ServiceNow attachment upload succeeded' : self::ATTACHMENT_FAILURE_MESSAGE,
                 array_merge($logContext, [
                     'catalog_label' => $itemLabel,
                     'field'         => $field,
                     'file_name'     => (string) $fileName,
                     'ritm_sys_id'   => $ritmSysId,
                     'http_code'     => $upload['httpCode'] ?? null,
-                    'error'         => $upload['error'] ?? null,
+                    'error'         => $uploaded ? null : (string) ($upload['error'] ?? 'Unknown error.'),
                 ])
             );
+
+            if (!$uploaded) {
+                $failures[] = $this->formatAttachmentFailureReason(
+                    (string) $fileName,
+                    $field,
+                    $upload['error'] ?? null,
+                    $upload['httpCode'] ?? null
+                );
+            }
         }
+
+        return $failures;
+    }
+
+    /**
+     * Formats a submission failure reason for display, e.g.
+     * "Mandatory variables are missing (HTTP 400)".
+     *
+     * @param mixed $error    Error message (string or null).
+     * @param mixed $httpCode HTTP status code, when the request reached ServiceNow.
+     */
+    private function formatFailureReason($error, $httpCode): string
+    {
+        $reason = trim((string) $error);
+        if ($reason === '') {
+            $reason = 'Unknown error.';
+        }
+
+        $code = (int) $httpCode;
+        if ($code > 0 && strpos($reason, 'HTTP ' . $code) === false) {
+            $reason .= ' (HTTP ' . $code . ')';
+        }
+
+        return $reason;
+    }
+
+    /**
+     * Formats an attachment upload failure for display, identifying the file
+     * (or field) that could not be attached when known.
+     */
+    private function formatAttachmentFailureReason(?string $fileName, ?string $field, $error, $httpCode): string
+    {
+        $reason   = $this->formatFailureReason($error, $httpCode);
+        $fileName = trim((string) $fileName);
+        $field    = trim((string) $field);
+
+        if ($fileName !== '') {
+            return 'Attachment "' . $fileName . '"' . ($field !== '' ? ' (' . $field . ')' : '') . ': ' . $reason;
+        }
+        if ($field !== '') {
+            return 'Attachment field ' . $field . ': ' . $reason;
+        }
+        return 'Attachments: ' . $reason;
+    }
+
+    /**
+     * Builds a "<column> in (?, ?, ...)" clause for queryLogs()/countLogs().
+     */
+    private function buildInClause(string $column, array $values): string
+    {
+        return $column . ' in (' . implode(', ', array_fill(0, max(1, count($values)), '?')) . ')';
+    }
+
+    /**
+     * Emails the catalog item's failure notification recipients about a
+     * failed submission (or, when $attachmentsOnly is true, a request that was
+     * created but whose attachments could not all be uploaded).
+     *
+     * Notifications never interrupt the save: any problem sending them is
+     * caught and written to the module log instead.
+     *
+     * @param array       $item            Catalog item configuration (from getCatalogItems()).
+     * @param array       $context         record, event_id, instrument, instance, catalog_label.
+     * @param bool        $attachmentsOnly True when the RITM was created but attachments failed.
+     * @param string[]    $reasons         One human-readable failure reason per problem.
+     * @param string|null $requestNumber   ServiceNow request number, when one was created.
+     */
+    private function sendFailureNotification(
+        array $item,
+        array $context,
+        bool $attachmentsOnly,
+        array $reasons,
+        ?string $requestNumber = null
+    ): void {
+        $recipients = array_values(array_filter((array) ($item['failureEmails'] ?? []), 'is_string'));
+        if (empty($recipients)) {
+            return;
+        }
+
+        $logContext = [
+            'record'        => $context['record'] ?? null,
+            'event_id'      => $context['event_id'] ?? null,
+            'instrument'    => $context['instrument'] ?? null,
+            'instance'      => $context['instance'] ?? null,
+            'catalog_label' => $context['catalog_label'] ?? null,
+        ];
+
+        try {
+            $projectId = (int) $this->framework->getProjectId();
+            [$subject, $body] = $this->buildFailureNotification($item, $context, $attachmentsOnly, $reasons, $requestNumber);
+
+            $contactEmail = (string) ($GLOBALS['project_contact_email'] ?? '');
+            $from = method_exists('\Message', 'useDoNotReply') ? \Message::useDoNotReply($contactEmail) : $contactEmail;
+
+            $failedRecipients = [];
+            foreach ($recipients as $to) {
+                if (!\REDCap::email($to, $from, $subject, $body, '', '', '', [], $projectId)) {
+                    $failedRecipients[] = $to;
+                }
+            }
+
+            if (!empty($failedRecipients)) {
+                $this->framework->log(self::NOTIFICATION_FAILURE_MESSAGE, array_merge($logContext, [
+                    'recipients' => implode(', ', $failedRecipients),
+                    'error'      => 'REDCap could not send the email.',
+                ]));
+            }
+        } catch (\Throwable $e) {
+            try {
+                $this->framework->log(self::NOTIFICATION_FAILURE_MESSAGE, array_merge($logContext, [
+                    'recipients' => implode(', ', $recipients),
+                    'error'      => $e->getMessage(),
+                ]));
+            } catch (\Throwable $ignored) {
+                // Never let notification problems break the record save.
+            }
+        }
+    }
+
+    /**
+     * Builds the subject and HTML body of a failure notification email.
+     *
+     * Only identifying context (project, catalog item, record ID, event,
+     * form, instance) and the failure reason are included — never mapped
+     * record values. Every interpolated value is HTML-escaped.
+     *
+     * @return array{0: string, 1: string} [subject, html body]
+     */
+    private function buildFailureNotification(
+        array $item,
+        array $context,
+        bool $attachmentsOnly,
+        array $reasons,
+        ?string $requestNumber
+    ): array {
+        $projectId = (int) $this->framework->getProjectId();
+        $record    = (string) ($context['record'] ?? '');
+        $label     = (string) ($item['label'] ?? '');
+        $esc       = static function ($value): string {
+            return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+        };
+
+        $projectTitle = '';
+        try {
+            $projectTitle = (string) $this->framework->getProject($projectId)->getTitle();
+        } catch (\Throwable $e) {
+            // Fall back to the PID alone.
+        }
+
+        $instrument      = (string) ($context['instrument'] ?? '');
+        $instrumentLabel = $instrument !== '' ? (string) (\REDCap::getInstrumentNames($instrument) ?: $instrument) : '';
+        $eventLabel      = '';
+        if (\REDCap::isLongitudinal() && !empty($context['event_id'])) {
+            $eventLabel = (string) (\REDCap::getEventNames(false, true, (int) $context['event_id']) ?: '');
+        }
+        $instance = (int) ($context['instance'] ?? 1);
+
+        $recordUrl = APP_PATH_WEBROOT_FULL . 'redcap_v' . REDCAP_VERSION . '/DataEntry/record_home.php?'
+                   . http_build_query(['pid' => $projectId, 'id' => $record]);
+        $logUrl    = $this->framework->getUrl('pages/config.php') . '#submission-log';
+
+        $subject = ($attachmentsOnly ? 'ServiceNow attachment upload failed: ' : 'ServiceNow submission failed: ')
+                 . $label . ' (PID ' . $projectId . ')';
+
+        $rows = [
+            'Project'      => $esc($projectTitle !== '' ? "$projectTitle (PID $projectId)" : "PID $projectId"),
+            'Catalog item' => $esc($label),
+            'Record'       => '<a href="' . $esc($recordUrl) . '">' . $esc($record) . '</a>',
+        ];
+        if ($eventLabel !== '') {
+            $rows['Event'] = $esc($eventLabel);
+        }
+        if ($instrumentLabel !== '') {
+            $rows['Trigger form'] = $esc($instrumentLabel);
+        }
+        if ($instance > 1) {
+            $rows['Instance'] = $esc($instance);
+        }
+        if ($attachmentsOnly && $requestNumber !== null && $requestNumber !== '') {
+            $rows['Request number'] = $esc($requestNumber);
+        }
+        $rows['Time'] = $esc(date('Y-m-d H:i:s'));
+
+        $body  = '<p>' . ($attachmentsOnly
+            ? 'A ServiceNow request was created from a REDCap record, but one or more files could not be attached to it.'
+            : 'A REDCap record could not be submitted to ServiceNow.') . '</p>';
+        $body .= '<table cellpadding="4" cellspacing="0" border="0">';
+        foreach ($rows as $name => $value) {
+            $body .= '<tr><td style="vertical-align:top"><strong>' . $esc($name) . '</strong></td><td>' . $value . '</td></tr>';
+        }
+        $body .= '</table>';
+        $body .= '<p><strong>' . (count($reasons) === 1 ? 'Failure reason' : 'Failure reasons') . ':</strong></p><ul>';
+        foreach ($reasons as $reason) {
+            $body .= '<li>' . $esc($reason) . '</li>';
+        }
+        $body .= '</ul>';
+        $body .= '<p>' . ($attachmentsOnly
+            ? 'Saving the record again would create a new request, so attach the file(s) to the existing request in ServiceNow manually.'
+            : 'Once the problem is resolved, you can retry by saving the trigger form again (if the push criteria still pass) '
+            . 'or create the request in ServiceNow manually. If the failure was a timeout or connection error, check '
+            . 'ServiceNow first &mdash; the request may have been created even though no confirmation was received.') . '</p>';
+        $body .= '<p><a href="' . $esc($logUrl) . '">View the submission log</a></p>';
+
+        return [$subject, $body];
     }
 
     /**

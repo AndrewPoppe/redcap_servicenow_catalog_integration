@@ -16,6 +16,7 @@
     - [Matching Values](#matching-values)
     - [Attachments](#attachments)
     - [Trigger Settings](#trigger-settings)
+    - [Failure Notifications](#failure-notifications)
   - [Submission Log](#submission-log)
 - [What Gets Sent to ServiceNow](#what-gets-sent-to-servicenow)
 - [Logging and Troubleshooting](#logging-and-troubleshooting)
@@ -39,7 +40,8 @@ The module provides a point-and-click configuration page within the REDCap proje
 - Match REDCap choice values (radio, dropdown, checkbox, etc.) to ServiceNow choice values
 - Attach files uploaded to REDCap *File Upload* fields to the resulting ServiceNow request item
 - Control exactly when a submission fires, using a trigger form and optional record-based criteria
-- Review a searchable log of every successful submission, with direct links to the resulting requests in ServiceNow
+- Review a searchable log of every submission attempt — successful or not — with direct links to the resulting requests in ServiceNow and the reason for any failure
+- Email a list of recipients, per catalog item, whenever a submission fails
 
 ### How does it work?
 
@@ -51,7 +53,7 @@ The module provides a point-and-click configuration page within the REDCap proje
 4. If so, the module builds a submission from the record's data using the configured field and value mappings and orders the catalog item in ServiceNow using the [Service Catalog API](https://www.servicenow.com/docs/r/zurich/api-reference/rest-apis/c_ServiceCatalogAPI.html) (`order_now`).
 5. ServiceNow creates a Request (REQ) and Request Item (RITM), which then flow through whatever workflow is attached to the catalog item in ServiceNow.
 6. If any REDCap *File Upload* fields are configured as attachments, the module uploads those files to the newly created RITM.
-7. The outcome (success or failure) is logged, and successful submissions appear in the module's [Submission Log](#submission-log).
+7. The outcome (success or failure) is logged and appears in the module's [Submission Log](#submission-log). If the submission fails, or an attachment cannot be uploaded, the catalog item's [failure notification](#failure-notifications) recipients (if any) are emailed.
 
 All of this happens in the background — the person saving the REDCap record does not need to do anything special, and they do not need a ServiceNow account.
 
@@ -81,8 +83,9 @@ Once installed, enable the module in the REDCap project(s) that should submit ca
 4. Click **Add Catalog Item**, enter the catalog item's **sys_id**, and click **Load Fields** to pull in the catalog item's variables from ServiceNow.
 5. Map each ServiceNow variable to the REDCap field that should supply its value, and match choice values where needed.
 6. Choose a **Trigger Form** and (optionally) add **Push Criteria**.
-7. Save the catalog item and make sure it is marked **Active**.
-8. Save a test record on the trigger form and confirm the request appears in ServiceNow and in the module's [Submission Log](#submission-log).
+7. (Optional) Enter one or more **Failure Notification** email addresses.
+8. Save the catalog item and make sure it is marked **Active**.
+9. Save a test record on the trigger form and confirm the request appears in ServiceNow and in the module's [Submission Log](#submission-log).
 
 ## The Configuration Page
 
@@ -150,7 +153,7 @@ Notes:
 
 - Only *File Upload* fields are listed.
 - Attachments are uploaded as a follow-up step after the RITM is created (the ServiceNow ordering endpoint cannot carry files). If the RITM creation fails, no attachments are sent.
-- Each attachment upload is logged individually, so failed uploads can be identified and investigated.
+- Each attachment upload is logged individually. Failed uploads appear in the [Submission Log](#submission-log) with an **Attachment Failed** status and trigger a [failure notification](#failure-notifications).
 
 #### Trigger Settings
 
@@ -179,19 +182,36 @@ Criteria compare a single value against the field. For checkbox fields, select t
 
 > 🚩 **Note:** The module currently does not track which records have already been submitted. If the trigger form is saved again and the criteria still pass, a **new** request will be created in ServiceNow. Design your trigger criteria accordingly (e.g., gate on a status field that changes after submission).
 
+#### Failure Notifications
+
+| Setting | Required | Description |
+|---|---|---|
+| Notification Email Addresses | No | One or more email addresses to notify when a submission for this catalog item fails. Separate multiple addresses with commas, semicolons, or new lines. Leave blank to turn off notifications for this catalog item. |
+
+Each address receives a separate email when:
+
+- **The submission fails** — ServiceNow rejects the request, cannot be reached, or the connection settings are invalid. No request item is created.
+- **An attachment cannot be uploaded** — the request was created, but one or more configured files could not be attached to it. A single email lists every file that failed.
+
+The email includes the project, catalog item, record ID (linked to the record home page), event (longitudinal projects), trigger form, instance (repeating instances), request number (attachment failures only), the failure reason(s), and a link to the [Submission Log](#submission-log). Mapped record values are never included.
+
+Emails are sent from the REDCap "do not reply" address if one is configured, otherwise from the system contact email. Each failure sends its own email (there is no throttling), so an outage on the ServiceNow side during a busy period can generate many notifications. If REDCap cannot send a notification, a `ServiceNow failure notification could not be sent` entry is written to the External Module logs.
+
 ### Submission Log
 
-The **Submission Log** tab lists every successful request item (RITM) submission made from the project. The table is searchable, sortable, and paginated, and includes:
+The **Submission Log** tab lists every request item (RITM) submission attempt made from the project — successful submissions, failed submissions, and attachment uploads that failed. The table is searchable, sortable, and paginated, and includes:
 
 | Column | Description |
 |---|---|
 | Timestamp | When the submission occurred |
+| Status | **Success**, **Failed** (no request was created), or **Attachment Failed** (the request was created but a file could not be attached) |
 | Record | The REDCap record ID, linked to the record home page |
 | Catalog Item | The label of the catalog item configuration that fired |
 | Trigger Form | The instrument whose save triggered the submission |
 | Request Number | The ServiceNow request number (REQ), linked directly to the request in your ServiceNow instance |
+| Failure Reason | For failures, the error returned by ServiceNow (with the HTTP status code when available), or a description of the connection or attachment problem |
 
-Use the search box to filter by record, catalog item label, trigger form, or request number.
+Use the **Show** dropdown to display all entries, successful submissions only, or failures only. Use the search box to filter by record, catalog item label, trigger form, request number, failure reason, or attachment file name.
 
 ## What Gets Sent to ServiceNow
 
@@ -213,9 +233,9 @@ Nothing else from the record is transmitted — only the variables you have expl
 
 The module logs extensively to the External Module logs:
 
-- Every successful RITM submission (these entries power the [Submission Log](#submission-log))
-- Every failed submission, including the HTTP status and error message returned by ServiceNow
-- Every attachment upload, successful or failed
+- Every RITM submission, successful or failed, including the HTTP status and error message returned by ServiceNow for failures (these entries power the [Submission Log](#submission-log))
+- Every attachment upload, successful or failed (failed uploads also appear in the Submission Log)
+- Any [failure notification](#failure-notifications) email that REDCap could not send
 
 Verbose debug entries (trigger evaluation, record data, and submitted variables) can be enabled by a developer by setting the `DEBUG` constant in the module's main class to `true`. This is disabled by default. Because these debug entries may contain REDCap record values, only enable them temporarily for troubleshooting and ensure access to the External Module logs is limited appropriately.
 
@@ -225,7 +245,7 @@ If submissions are not appearing in ServiceNow, check the following:
 2. Does the saved instrument match the configured **Trigger Form**?
 3. Does at least one **Push Criteria** condition group pass for the record in question?
 4. Does the **Test Connection** button succeed with the saved credentials?
-5. Check the External Module logs (via the module's log interface) for failure entries with error details from ServiceNow.
+5. Check the [Submission Log](#submission-log) (set **Show** to *Failures only*) for failed submissions and the reason ServiceNow gave, or the External Module logs for full details.
 
 ## Security Considerations
 
@@ -235,6 +255,7 @@ If submissions are not appearing in ServiceNow, check the following:
 - ServiceNow credentials are stored as module project settings. The saved password is not displayed back in the browser.
 - Use a dedicated ServiceNow service account with the minimum access required (Service Catalog API for the relevant items, `sc_req_item` read, and Attachment API if using attachments) rather than a personal account.
 - Only the specific field values you map are sent to ServiceNow. Review your mappings carefully before activating a catalog item if your project contains identifiers or other sensitive data.
+- Failure notification emails contain the record ID and the failure reason, but no mapped record values. Note that a ServiceNow error message may occasionally quote a submitted value. Only add recipients who are permitted to see the project's record IDs, and keep in mind that the record ID itself may be an identifier in some projects.
 
 ## FAQ
 

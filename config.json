@@ -112,6 +112,13 @@
                     "type": "text",
                     "required": false,
                     "hidden": true
+                },
+                {
+                    "key": "catalog-item-failure-emails",
+                    "name": "Failure Notification Emails (JSON)",
+                    "type": "text",
+                    "required": false,
+                    "hidden": true
                 }
             ]
         }

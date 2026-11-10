@@ -303,21 +303,7 @@ class ServiceNowApiClient
             return ['success' => false, 'error' => 'Connection failed: ' . $curlErr];
         }
 
-        $decoded = json_decode($response, true);
-
-        if ($httpCode >= 200 && $httpCode < 300) {
-            return [
-                'success'  => true,
-                'data'     => $decoded['result'] ?? $decoded,
-                'httpCode' => $httpCode,
-            ];
-        }
-
-        $errMsg = $decoded['error']['message']
-               ?? $decoded['error']['detail']
-               ?? ('Unexpected HTTP ' . $httpCode);
-
-        return ['success' => false, 'error' => $errMsg, 'httpCode' => $httpCode];
+        return $this->parseResponse($response, $httpCode);
     }
 
     /**
@@ -367,7 +353,19 @@ class ServiceNowApiClient
             return ['success' => false, 'error' => 'Connection failed: ' . $curlErr];
         }
 
-        $decoded = json_decode($response, true);
+        return $this->parseResponse($response, $httpCode);
+    }
+
+    /**
+     * Converts a raw ServiceNow response into the client's result shape.
+     *
+     * @param  string|bool $response  Raw response body from curl_exec().
+     * @param  int         $httpCode  HTTP status code of the response.
+     * @return array{success: bool, data?: mixed, error?: string, httpCode?: int}
+     */
+    private function parseResponse($response, int $httpCode): array
+    {
+        $decoded = is_string($response) ? json_decode($response, true) : null;
 
         if ($httpCode >= 200 && $httpCode < 300) {
             return [
@@ -377,11 +375,42 @@ class ServiceNowApiClient
             ];
         }
 
-        $errMsg = $decoded['error']['message']
-               ?? $decoded['error']['detail']
-               ?? ('Unexpected HTTP ' . $httpCode);
+        return [
+            'success'  => false,
+            'error'    => $this->extractErrorMessage($decoded, $httpCode),
+            'httpCode' => $httpCode,
+        ];
+    }
 
-        return ['success' => false, 'error' => $errMsg, 'httpCode' => $httpCode];
+    /**
+     * Builds a human-readable failure reason from a ServiceNow error body.
+     *
+     * ServiceNow errors usually look like
+     *   {"error": {"message": "...", "detail": "..."}, "status": "failure"}
+     * where `message` is a short summary and `detail` carries the specifics, so
+     * both are kept when present.
+     *
+     * @param mixed $decoded  JSON-decoded response body (null when not JSON).
+     */
+    private function extractErrorMessage($decoded, int $httpCode): string
+    {
+        $error = is_array($decoded) ? ($decoded['error'] ?? null) : null;
+
+        if (is_string($error) && trim($error) !== '') {
+            return trim($error);
+        }
+
+        $message = (is_array($error) && is_scalar($error['message'] ?? null)) ? trim((string) $error['message']) : '';
+        $detail  = (is_array($error) && is_scalar($error['detail']  ?? null)) ? trim((string) $error['detail'])  : '';
+
+        if ($message !== '' && $detail !== '' && strcasecmp($message, $detail) !== 0) {
+            return $message . ': ' . $detail;
+        }
+        if ($message !== '' || $detail !== '') {
+            return $message !== '' ? $message : $detail;
+        }
+
+        return 'Unexpected HTTP ' . $httpCode;
     }
 
     /** Strips any character that is not a lowercase/uppercase hex digit. */
