@@ -107,17 +107,18 @@ class ServiceNowApiClient
     }
 
     /**
-     * Resolves the Request Item (RITM) sys_id belonging to a submitted request.
+     * Looks up the Request Item (RITM) belonging to a submitted request.
      *
-     * The `order_now` response returns the sys_id of the parent request
-     * (sc_request). Attachments must be posted against the request *item*
-     * (sc_req_item), so this looks up the RITM linked to that request via the
-     * Table API.
+     * The `order_now` response returns only the parent request (sc_request).
+     * Attachments must be posted against the request *item* (sc_req_item),
+     * and the RITM number is useful as a receipt, so this looks up the RITM
+     * linked to that request via the Table API.
      *
      * @param  string $requestSysId  sys_id of the sc_request record (order_now `request_id`).
-     * @return array{success: bool, sysId?: string, error?: string, httpCode?: int}
+     * @return array{success: bool, sysId?: string, number?: string, error?: string, httpCode?: int}
+     *         On success, `sysId` is the RITM sys_id and `number` its RITM number (e.g. RITM0012345).
      */
-    public function getRequestItemSysId(string $requestSysId): array
+    public function getRequestItem(string $requestSysId): array
     {
         $id = $this->sanitizeSysId($requestSysId);
         if ($id === '') {
@@ -127,7 +128,7 @@ class ServiceNowApiClient
         $result = $this->get(
             '/api/now/table/sc_req_item'
             . '?sysparm_query=' . rawurlencode('request=' . $id)
-            . '&sysparm_fields=sys_id'
+            . '&sysparm_fields=sys_id,number'
             . '&sysparm_limit=1'
         );
 
@@ -136,12 +137,16 @@ class ServiceNowApiClient
         }
 
         $rows  = is_array($result['data'] ?? null) ? $result['data'] : [];
-        $sysId = isset($rows[0]['sys_id']) ? (string) $rows[0]['sys_id'] : '';
+        $sysId = isset($rows[0]['sys_id']) && is_scalar($rows[0]['sys_id']) ? (string) $rows[0]['sys_id'] : '';
         if ($sysId === '') {
             return ['success' => false, 'error' => 'No request item found for request ' . $id . '.'];
         }
 
-        return ['success' => true, 'sysId' => $sysId];
+        return [
+            'success' => true,
+            'sysId'   => $sysId,
+            'number'  => isset($rows[0]['number']) && is_scalar($rows[0]['number']) ? (string) $rows[0]['number'] : '',
+        ];
     }
 
     /**

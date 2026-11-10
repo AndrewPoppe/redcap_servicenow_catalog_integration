@@ -16,8 +16,10 @@
     - [Matching Values](#matching-values)
     - [Attachments](#attachments)
     - [Trigger Settings](#trigger-settings)
+    - [Save Results to REDCap](#save-results-to-redcap)
     - [Failure Notifications](#failure-notifications)
   - [Submission Log](#submission-log)
+- [Confirmation Receipts](#confirmation-receipts)
 - [What Gets Sent to ServiceNow](#what-gets-sent-to-servicenow)
 - [Logging and Troubleshooting](#logging-and-troubleshooting)
 - [Security Considerations](#security-considerations)
@@ -40,6 +42,7 @@ The module provides a point-and-click configuration page within the REDCap proje
 - Match REDCap choice values (radio, dropdown, checkbox, etc.) to ServiceNow choice values
 - Attach files uploaded to REDCap *File Upload* fields to the resulting ServiceNow request item
 - Control exactly when a submission fires, using a trigger form and optional record-based criteria
+- Save the resulting ServiceNow request number, request item (RITM) number, and submission status back to the record, e.g. to show respondents a [confirmation receipt](#confirmation-receipts)
 - Review a searchable log of every submission attempt — successful or not — with direct links to the resulting requests in ServiceNow and the reason for any failure
 - Email a list of recipients, per catalog item, whenever a submission fails
 
@@ -52,8 +55,9 @@ The module provides a point-and-click configuration page within the REDCap proje
    - Does at least one of the item's push criteria condition groups (if any) pass for this record?
 4. If so, the module builds a submission from the record's data using the configured field and value mappings and orders the catalog item in ServiceNow using the [Service Catalog API](https://www.servicenow.com/docs/r/zurich/api-reference/rest-apis/c_ServiceCatalogAPI.html) (`order_now`).
 5. ServiceNow creates a Request (REQ) and Request Item (RITM), which then flow through whatever workflow is attached to the catalog item in ServiceNow.
-6. If any REDCap *File Upload* fields are configured as attachments, the module uploads those files to the newly created RITM.
-7. The outcome (success or failure) is logged and appears in the module's [Submission Log](#submission-log). If the submission fails, or an attachment cannot be uploaded, the catalog item's [failure notification](#failure-notifications) recipients (if any) are emailed.
+6. If [result fields](#save-results-to-redcap) are configured, the module saves the request number, RITM number, and submission status back to the record.
+7. If any REDCap *File Upload* fields are configured as attachments, the module uploads those files to the newly created RITM.
+8. The outcome (success or failure) is logged and appears in the module's [Submission Log](#submission-log). If the submission fails, or a follow-up step (attachments, saving results) fails, the catalog item's [failure notification](#failure-notifications) recipients (if any) are emailed.
 
 All of this happens in the background — the person saving the REDCap record does not need to do anything special, and they do not need a ServiceNow account.
 
@@ -65,7 +69,7 @@ On the ServiceNow side:
 - A ServiceNow service account (username and password) that:
   - Can authenticate with **basic authentication**
    - Can read the catalog list and has access to the **Service Catalog API** (`sn_sc`) for the catalog item(s) you want to order
-  - Has read access to the `sc_req_item` table via the **Table API** (used to locate the RITM when uploading attachments)
+  - Has read access to the `sc_req_item` table via the **Table API** (used to look up the RITM created by each submission, for the Submission Log, attachments, and saving the RITM number to REDCap)
   - Has access to the **Attachment API** (only needed if you use the attachments feature)
 - The **sys_id** of each catalog item you want to integrate with (a 32-character hexadecimal identifier, visible in the catalog item's URL or record in ServiceNow)
 
@@ -83,7 +87,7 @@ Once installed, enable the module in the REDCap project(s) that should submit ca
 4. Click **Add Catalog Item**, enter the catalog item's **sys_id**, and click **Load Fields** to pull in the catalog item's variables from ServiceNow.
 5. Map each ServiceNow variable to the REDCap field that should supply its value, and match choice values where needed.
 6. Choose a **Trigger Form** and (optionally) add **Push Criteria**.
-7. (Optional) Enter one or more **Failure Notification** email addresses.
+7. (Optional) Choose **Save Results to REDCap** fields and enter one or more **Failure Notification** email addresses.
 8. Save the catalog item and make sure it is marked **Active**.
 9. Save a test record on the trigger form and confirm the request appears in ServiceNow and in the module's [Submission Log](#submission-log).
 
@@ -180,7 +184,26 @@ Criteria compare a single value against the field. For checkbox fields, select t
 
 > 💡 **Tip:** A common pattern is to add a condition like `my_form_complete` **Equals** `2` so requests are only submitted when the form is marked Complete, or to use a dedicated "Submit to ServiceNow?" yes/no field as a gate.
 
-> 🚩 **Note:** The module currently does not track which records have already been submitted. If the trigger form is saved again and the criteria still pass, a **new** request will be created in ServiceNow. Design your trigger criteria accordingly (e.g., gate on a status field that changes after submission).
+> 🚩 **Note:** The module does not itself track which records have already been submitted. If the trigger form is saved again and the criteria still pass, a **new** request will be created in ServiceNow. Design your trigger criteria accordingly. The simplest approach is to [save the request number to a field](#save-results-to-redcap) and add a condition that the field **Is empty**. Because a failed submission clears that field, the record is then submitted once, and is retried on the next save if it fails.
+
+#### Save Results to REDCap
+
+After each submission, the module can write the outcome back to the record so it can be piped into survey completion text, confirmation emails, alerts, or reports. See [Confirmation Receipts](#confirmation-receipts) for a step-by-step example.
+
+| Setting | Required | Value saved after a successful submission | Value saved after a failed submission |
+|---|---|---|---|
+| Request Number | No | The ServiceNow request number, e.g. `REQ0012345` | *(cleared)* |
+| Request Item (RITM) Number | No | The request item number, e.g. `RITM0012345` | *(cleared)* |
+| Submission Status | No | `Submitted` | `Failed` |
+
+Details:
+
+- Only **text fields without validation** and **notes fields** can be selected, and never the record ID field. Choose a different field for each setting, and (if several catalog items share a trigger form) for each catalog item.
+- Values are written to the same record and event that triggered the submission. Fields on the trigger form are written to the same repeating instance. Fields on a non-repeating instrument are also supported. Fields on a *different* repeating instrument are not, because the instance to update would be ambiguous.
+- The values are saved during the record save, **before** REDCap displays the survey completion text or sends the survey confirmation email, so both can pipe them.
+- Saving uses REDCap's standard data import, so the change appears in the project's Logging page. Alerts that use the trigger *"When conditional logic is TRUE during a data import, data entry, or survey"* can react to it.
+- The RITM number comes from a lookup the module makes after every successful submission (the ordering endpoint returns only the request number). If that lookup fails, the RITM Number field is cleared and the problem is reported as **Save to REDCap Failed**.
+- If the values cannot be saved (for example, the record or form is locked, or a selected field was deleted or changed type), the submission itself is unaffected. The problem appears in the [Submission Log](#submission-log) with the status **Save to REDCap Failed** and triggers a [failure notification](#failure-notifications).
 
 #### Failure Notifications
 
@@ -191,9 +214,9 @@ Criteria compare a single value against the field. For checkbox fields, select t
 Each address receives a separate email when:
 
 - **The submission fails** — ServiceNow rejects the request, cannot be reached, or the connection settings are invalid. No request item is created.
-- **An attachment cannot be uploaded** — the request was created, but one or more configured files could not be attached to it. A single email lists every file that failed.
+- **A follow-up step fails** — the request was created, but one or more configured files could not be attached to it, or the [results could not be saved to REDCap](#save-results-to-redcap). A single email lists every problem.
 
-The email includes the project, catalog item, record ID (linked to the record home page), event (longitudinal projects), trigger form, instance (repeating instances), request number (attachment failures only), the failure reason(s), and a link to the [Submission Log](#submission-log). Mapped record values are never included.
+The email includes the project, catalog item, record ID (linked to the record home page), event (longitudinal projects), trigger form, instance (repeating instances), request and request item numbers (when a request was created), the failure reason(s), and a link to the [Submission Log](#submission-log). Mapped record values are never included.
 
 Emails are sent from the REDCap "do not reply" address if one is configured, otherwise from the system contact email. Each failure sends its own email (there is no throttling), so an outage on the ServiceNow side during a busy period can generate many notifications. If REDCap cannot send a notification, a `ServiceNow failure notification could not be sent` entry is written to the External Module logs.
 
@@ -204,14 +227,81 @@ The **Submission Log** tab lists every request item (RITM) submission attempt ma
 | Column | Description |
 |---|---|
 | Timestamp | When the submission occurred |
-| Status | **Success**, **Failed** (no request was created), or **Attachment Failed** (the request was created but a file could not be attached) |
+| Status | **Success**; **Failed** (no request was created); **Attachment Failed** (the request was created but a file could not be attached); or **Save to REDCap Failed** (the request was created but the [result fields](#save-results-to-redcap) could not be updated) |
 | Record | The REDCap record ID, linked to the record home page |
 | Catalog Item | The label of the catalog item configuration that fired |
 | Trigger Form | The instrument whose save triggered the submission |
 | Request Number | The ServiceNow request number (REQ), linked directly to the request in your ServiceNow instance |
+| Request Item | The request item number (RITM), linked directly to the request item in your ServiceNow instance. Blank for entries logged before this column was added, or if the module could not look up the RITM (check that the service account can read the `sc_req_item` table) |
 | Failure Reason | For failures, the error returned by ServiceNow (with the HTTP status code when available), or a description of the connection or attachment problem |
 
-Use the **Show** dropdown to display all entries, successful submissions only, or failures only. Use the search box to filter by record, catalog item label, trigger form, request number, failure reason, or attachment file name.
+Use the **Show** dropdown to display all entries, successful submissions only, or failures only. Use the search box to filter by record, catalog item label, trigger form, request number, request item number, failure reason, or attachment file name.
+
+## Confirmation Receipts
+
+A common goal is to give the person who submitted the request a receipt that confirms it was submitted, gives the ServiceNow request and RITM numbers, and recaps what was submitted. The module doesn't send receipts itself. Instead, it [saves the results to the record](#save-results-to-redcap), and REDCap's own features — the survey completion text, the survey confirmation email, and Alerts & Notifications — deliver the receipt using piping (see the **How to use Piping here** link next to any piping-enabled setting in REDCap).
+
+### Step 1: Add fields to hold the results
+
+Add these fields to the **trigger form** (the survey). Text Box fields need **no validation**.
+
+| Variable (example) | Field type | Action tags | Purpose |
+|---|---|---|---|
+| `sn_request_number` | Text Box | `@HIDDEN-SURVEY` | Request number (REQ) |
+| `sn_ritm_number` | Text Box | `@HIDDEN-SURVEY` | Request item number (RITM) |
+| `sn_submission_status` | Text Box | `@HIDDEN-SURVEY` | `Submitted` or `Failed` |
+
+`@HIDDEN-SURVEY` keeps the fields off the survey page but leaves them visible to staff on the data entry form. The variable names are only examples; any names work.
+
+> ⚠️ If the project is in production, add the fields through Draft Mode and get the changes approved before selecting them in the module.
+
+### Step 2: Select the fields in the module
+
+Edit the catalog item, select the three fields under **Save Results to REDCap**, and save.
+
+**Recommended:** also add a push criterion `sn_request_number` **Is empty**, so each record is only submitted once. A failed submission clears the field, so re-saving the form retries it.
+
+### Step 3: Write the completion text
+
+In **Survey Settings → Survey Completion Text**, pipe the result fields and whichever submitted fields you want to recap:
+
+```html
+<p><strong>Thank you. Your request has been received.</strong></p>
+<p>Request number: [sn_request_number]<br>
+   Request item: [sn_ritm_number]</p>
+<p>Here is a summary of what you submitted:</p>
+<ul>
+  <li>Requested for: [requested_for_name] ([requested_for_email])</li>
+  <li>Job type: [job_type]</li>
+</ul>
+```
+
+Multiple choice fields pipe their label by default (add `:value` for the raw code). Checkbox fields pipe a comma-separated list of checked labels.
+
+### Step 4: Send a confirmation email (optional)
+
+You have two options:
+
+- **Survey confirmation email** (*Survey Settings → Send confirmation email?*). Pipe the same fields into the subject and message. The email goes to the respondent's email address field. You can also attach a PDF of the completed survey, but REDCap warns against this if the survey collects identifiers.
+- **Alerts & Notifications.** Create an alert with the trigger *"When conditional logic is TRUE during a data import, data entry, or survey"* and the logic `[sn_submission_status] = "Submitted"`, send it to the requester's email field, and set it to send only once. A second alert with `[sn_submission_status] = "Failed"` can send a "we're looking into it" message instead.
+
+### Handling failed submissions
+
+The survey completion text and the survey confirmation email **cannot be made conditional**. If the submission fails, they are still shown/sent, with blank request numbers. Choose one of these approaches:
+
+1. **Use neutral wording** and pipe the status, e.g. *"Submission status: [sn_submission_status]. Request number: [sn_request_number:hideunderscore]"*. (`:hideunderscore` pipes a blank value instead of `______`.)
+2. **Use a calculated message field.** Add a hidden `@CALCTEXT` field and pipe it into the completion text and email:
+
+   ```
+   @HIDDEN-SURVEY @CALCTEXT(if([sn_submission_status] = "Submitted", concat("Your request number is ", [sn_request_number], " (", [sn_ritm_number], ")."), "We could not submit your request automatically. Our team has been notified and will follow up."))
+   ```
+
+   REDCap recalculates this field on the server after the module saves the results, unless auto-calculations are disabled for the project. Confirm the wording with a test submission. Only promise that "our team has been notified" if [failure notifications](#failure-notifications) are configured.
+3. **Use two Alerts** (success and failure) instead of the survey confirmation email, as described in Step 4.
+
+### Why this works
+
+When a survey is submitted, REDCap runs the module's save hook — which submits the request to ServiceNow and saves the results to the record — **before** it sends the survey confirmation email and before it displays the completion text. Both read the record's data at that moment, so the request numbers are already filled in. The respondent waits on the final page while this happens (normally a second or two, plus the time to upload any attachments).
 
 ## What Gets Sent to ServiceNow
 
@@ -235,6 +325,7 @@ The module logs extensively to the External Module logs:
 
 - Every RITM submission, successful or failed, including the HTTP status and error message returned by ServiceNow for failures (these entries power the [Submission Log](#submission-log))
 - Every attachment upload, successful or failed (failed uploads also appear in the Submission Log)
+- Any failure to save [results back to the record](#save-results-to-redcap) (also shown in the Submission Log)
 - Any [failure notification](#failure-notifications) email that REDCap could not send
 
 Verbose debug entries (trigger evaluation, record data, and submitted variables) can be enabled by a developer by setting the `DEBUG` constant in the module's main class to `true`. This is disabled by default. Because these debug entries may contain REDCap record values, only enable them temporarily for troubleshooting and ensure access to the External Module logs is limited appropriately.
@@ -273,9 +364,13 @@ If submissions are not appearing in ServiceNow, check the following:
 
 4. **What happens if the same record is saved twice?**
 
-   If the trigger form is saved again and the criteria still pass, a second request is created in ServiceNow. Use push criteria (e.g., a status field) to control this.
+   If the trigger form is saved again and the criteria still pass, a second request is created in ServiceNow. To prevent this, [save the request number to a field](#save-results-to-redcap) and add a push criterion that the field **Is empty**.
 
-5. **Where do I find a catalog item's sys_id?**
+5. **Can the person who submitted the request get a receipt with the request number?**
+
+   Yes. See [Confirmation Receipts](#confirmation-receipts).
+
+6. **Where do I find a catalog item's sys_id?**
 
    In ServiceNow, open the catalog item's record (e.g., in the `sc_cat_item` table or via the catalog item's URL) and copy the 32-character `sys_id` value.
 

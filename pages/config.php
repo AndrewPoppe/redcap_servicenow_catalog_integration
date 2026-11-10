@@ -55,13 +55,16 @@ foreach ($metaData as $fieldInfo) {
             break;
     }
     $redcapFields[] = [
-        'name'    => $fieldInfo['field_name'],
-        'label'   => strip_tags($fieldInfo['field_label']),
-        'type'    => $fieldInfo['field_type'],
-        'form'    => $fieldInfo['form_name'],
-        'choices' => $fieldChoices,
+        'name'       => $fieldInfo['field_name'],
+        'label'      => strip_tags($fieldInfo['field_label']),
+        'type'       => $fieldInfo['field_type'],
+        'validation' => (string) ($fieldInfo['text_validation_type_or_show_slider_number'] ?? ''),
+        'form'       => $fieldInfo['form_name'],
+        'choices'    => $fieldChoices,
     ];
 }
+
+$recordIdField = (string) \REDCap::getRecordIdField();
 
 $instrumentNames = \REDCap::getInstrumentNames();
 $redcapForms     = [];
@@ -367,8 +370,9 @@ foreach ($redcapForms as $form) {
             <div class="card-body">
                 <div class="d-flex justify-content-between align-items-center flex-wrap mb-2" style="gap:0.5rem">
                     <p class="text-muted small mb-0">
-                        Every ServiceNow request item (RITM) submission attempt is recorded below, including failed
-                        submissions and attachment uploads that failed, with the reason for each failure.
+                        Every ServiceNow request item (RITM) submission attempt is recorded below. That includes
+                        failed submissions, and follow-up steps that failed after a request was created (attachment
+                        uploads, or saving results back to the record), each with the reason for the failure.
                     </p>
                     <div class="d-flex align-items-center" style="gap:0.5rem">
                         <label for="log-status-filter" class="small text-muted mb-0 text-nowrap">Show:</label>
@@ -388,6 +392,7 @@ foreach ($redcapForms as $form) {
                             <th>Catalog Item</th>
                             <th>Trigger Form</th>
                             <th>Request Number</th>
+                            <th>Request Item</th>
                             <th>Failure Reason</th>
                         </tr>
                     </thead>
@@ -560,6 +565,48 @@ foreach ($redcapForms as $form) {
                     </div>
                 </div>
 
+                <!-- Save Results to REDCap -->
+                <div class="card shadow-sm mb-4">
+                    <div class="card-header">
+                        <i class="fas fa-reply mr-1"></i> Save Results to REDCap
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-3">
+                            After each submission, the module can save the ServiceNow request details back to the
+                            record. You can then pipe them into the survey completion text, the confirmation email, or
+                            an alert, e.g. <code>[sn_request_number]</code>. All three are optional. Only text fields
+                            without validation and notes fields are listed (the record ID field is excluded). To keep the
+                            fields off the survey itself, add <code>@HIDDEN-SURVEY</code> to each one.
+                        </p>
+                        <div class="row">
+                            <div class="col-md-4 form-group">
+                                <label for="modal-result-request-number" class="font-weight-bold">Request Number</label>
+                                <select class="form-control result-field-select" id="modal-result-request-number"
+                                        data-result-key="requestNumber"></select>
+                                <small class="form-text text-muted">e.g. REQ0012345</small>
+                            </div>
+                            <div class="col-md-4 form-group">
+                                <label for="modal-result-ritm-number" class="font-weight-bold">Request Item (RITM) Number</label>
+                                <select class="form-control result-field-select" id="modal-result-ritm-number"
+                                        data-result-key="ritmNumber"></select>
+                                <small class="form-text text-muted">e.g. RITM0012345</small>
+                            </div>
+                            <div class="col-md-4 form-group">
+                                <label for="modal-result-status" class="font-weight-bold">Submission Status</label>
+                                <select class="form-control result-field-select" id="modal-result-status"
+                                        data-result-key="status"></select>
+                                <small class="form-text text-muted">
+                                    Set to <code>Submitted</code> or <code>Failed</code>.
+                                </small>
+                            </div>
+                        </div>
+                        <small class="form-text text-muted mt-0">
+                            When a submission fails, the status is set to <code>Failed</code> and both number fields are
+                            cleared. Fields on the trigger form are written to the instance that was saved.
+                        </small>
+                    </div>
+                </div>
+
                 <!-- Failure Notifications -->
                 <div class="card shadow-sm mb-2">
                     <div class="card-header">
@@ -700,6 +747,7 @@ $(document).ready(function () {
     const RC_FORMS = new Map(RC_FORMS_JSON.map(f => [f.name, f.label]));
     let HAS_PASSWORD  = <?= $hasPassword ? 'true' : 'false' ?>;
     const RECORD_HOME_URL = <?= json_encode($recordHomeUrl) ?>;
+    const RECORD_ID_FIELD = <?= json_encode($recordIdField) ?>;
 
     // Structural / display-only types that have no submittable value
     const SKIP_TYPES = ['11', '12', '14', '15', '17', '19', '20', '24', '32'];
@@ -896,6 +944,46 @@ $(document).ready(function () {
             opts += '</optgroup>';
         });
         return opts;
+    }
+
+    // Builds <optgroup>ed <option>s for the "Save Results to REDCap" selects:
+    // text fields without validation and notes fields, excluding the record ID.
+    function isResultFieldCandidate(f) {
+        if (f.name === RECORD_ID_FIELD) return false;
+        return (f.type === 'text' && !f.validation) || f.type === 'notes';
+    }
+
+    function buildResultFieldOptions(selected) {
+        const formOrder = [];
+        const byForm    = {};
+        RC_FIELDS.forEach(function (f) {
+            if (!isResultFieldCandidate(f)) return;
+            if (!byForm[f.form]) {
+                formOrder.push(f.form);
+                byForm[f.form] = [];
+            }
+            byForm[f.form].push(f);
+        });
+        let opts = '<option value=""></option>';
+        formOrder.forEach(function (form) {
+            const formLabel = RC_FORMS.get(form) || form;
+            opts += '<optgroup label="' + escHtml(formLabel) + '">';
+            byForm[form].forEach(function (f) {
+                const sel  = (f.name === selected) ? ' selected' : '';
+                const text = escHtml(f.label) + ' [' + escHtml(f.name) + ']';
+                opts += '<option value="' + escHtml(f.name) + '"' + sel + '>' + text + '</option>';
+            });
+            opts += '</optgroup>';
+        });
+        return opts;
+    }
+
+    function collectResultFields() {
+        const fields = {};
+        $('#catalog-item-modal .result-field-select').each(function () {
+            fields[$(this).data('result-key')] = $(this).val() || '';
+        });
+        return fields;
     }
 
     function buildValueInput(fieldName, currentValue, hide) {
@@ -1169,6 +1257,7 @@ $(document).ready(function () {
         $('#modal-mapping-count').hide().text('');
         $('#modal-attachment-fields').empty().val(null);
         $('#modal-failure-emails').val('');
+        $('#catalog-item-modal .result-field-select').empty().val(null);
         $('#modal-criteria-container').empty();
         $('#modal-criteria-empty').show();
         modalCurrentSnapshot = null;
@@ -1211,6 +1300,19 @@ $(document).ready(function () {
                 allowClear:     true,
                 dropdownParent: $('#catalog-item-modal')
             });
+
+        // Save Results to REDCap selects
+        const resultFields = (item && item.resultFields) ? item.resultFields : {};
+        $('#catalog-item-modal .result-field-select').each(function () {
+            $(this)
+                .html(buildResultFieldOptions(resultFields[$(this).data('result-key')] || ''))
+                .select2({
+                    width:          '100%',
+                    placeholder:    '— Do not save —',
+                    allowClear:     true,
+                    dropdownParent: $('#catalog-item-modal')
+                });
+        });
     });
 
     $('#catalog-item-modal').on('hidden.bs.modal', function () {
@@ -1653,6 +1755,13 @@ $(document).ready(function () {
             return;
         }
 
+        const resultFields = collectResultFields();
+        const chosenResultFields = Object.values(resultFields).filter(Boolean);
+        if (new Set(chosenResultFields).size !== chosenResultFields.length) {
+            showAlert('warning', 'Choose a different REDCap field for each result in <strong>Save Results to REDCap</strong>.');
+            return;
+        }
+
         const fieldMappings = collectMappings();
         const valueMappings = collectValueMappings();
         const criteria      = collectModalCriteria();
@@ -1673,6 +1782,7 @@ $(document).ready(function () {
             triggerForm:   triggerForm,
             criteria:      criteria,
             snapshot:      modalCurrentSnapshot,
+            resultFields:  resultFields,
             failureEmails: failureEmails
         }).then(function (resp) {
             if (resp.success) {
@@ -1686,6 +1796,7 @@ $(document).ready(function () {
                     triggerForm:   triggerForm,
                     criteria:      criteria,
                     snapshot:      modalCurrentSnapshot,
+                    resultFields:  resp.resultFields || resultFields,
                     failureEmails: Array.isArray(resp.failureEmails) ? resp.failureEmails : failureEmails
                 };
                 CATALOG_ITEMS[resp.index] = newItem;
@@ -1856,8 +1967,21 @@ $(document).ready(function () {
     const LOG_STATUS_BADGES = {
         success:           { cls: 'bg-success',          icon: 'check-circle',         text: 'Success' },
         failed:            { cls: 'bg-danger',           icon: 'times-circle',         text: 'Failed' },
-        attachment_failed: { cls: 'bg-warning text-dark', icon: 'exclamation-triangle', text: 'Attachment Failed' }
+        attachment_failed: { cls: 'bg-warning text-dark', icon: 'exclamation-triangle', text: 'Attachment Failed' },
+        save_failed:       { cls: 'bg-warning text-dark', icon: 'exclamation-triangle', text: 'Save to REDCap Failed' }
     };
+
+    // Renders a ServiceNow number (REQ/RITM) as a link when its URL is known.
+    function renderServiceNowLink(urlKey) {
+        return function (d, type, row) {
+            if (type !== 'display') { return d || ''; }
+            if (!d) { return ''; }
+            if (row && row[urlKey]) {
+                return '<a href="' + escHtml(row[urlKey]) + '" target="_blank" rel="noopener">' + escHtml(d) + '</a>';
+            }
+            return escHtml(d);
+        };
+    }
 
     function buildStatusBadge(status) {
         const b = LOG_STATUS_BADGES[status] || LOG_STATUS_BADGES.failed;
@@ -1891,14 +2015,8 @@ $(document).ready(function () {
                 { data: 'record',        render: function (d, type) { return type === 'display' ? buildRecordLink(d) : (d || ''); } },
                 { data: 'catalog_label', render: function (d, type) { return type === 'display' ? escHtml(d || '') : (d || ''); } },
                 { data: 'instrument',    render: function (d, type) { return type === 'display' ? escHtml(formLabelFor(d)) : (d || ''); } },
-                { data: 'request_number',   render: function (d, type, row) {
-                    if (type !== 'display') { return d || ''; }
-                    if (!d) { return ''; }
-                    if (row && row.request_url) {
-                        return '<a href="' + escHtml(row.request_url) + '" target="_blank" rel="noopener">' + escHtml(d) + '</a>';
-                    }
-                    return escHtml(d);
-                } },
+                { data: 'request_number', render: renderServiceNowLink('request_url') },
+                { data: 'ritm_number',    render: renderServiceNowLink('ritm_url') },
                 { data: 'reason', orderable: false, className: 'sn-log-reason', render: function (d, type) {
                     if (type !== 'display') { return d || ''; }
                     return d ? '<small>' + escHtml(d) + '</small>' : '';
