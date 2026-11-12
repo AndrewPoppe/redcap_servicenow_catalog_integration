@@ -27,21 +27,64 @@
             "name": "ServiceNow Instance URL",
             "type": "text",
             "required": false,
-            "hidden": true
+            "hidden": true,
+            "super-users-only": true
         },
         {
             "key": "servicenow-username",
             "name": "ServiceNow Username",
             "type": "text",
             "required": false,
-            "hidden": true
+            "hidden": true,
+            "super-users-only": true
         },
         {
             "key": "servicenow-password",
             "name": "ServiceNow Password",
             "type": "password",
             "required": false,
-            "hidden": true
+            "hidden": true,
+            "super-users-only": true
+        },
+        {
+            "key": "servicenow-auth-type",
+            "name": "ServiceNow Authentication Method",
+            "type": "text",
+            "required": false,
+            "hidden": true,
+            "super-users-only": true
+        },
+        {
+            "key": "servicenow-oauth-grant-type",
+            "name": "ServiceNow OAuth Grant Type",
+            "type": "text",
+            "required": false,
+            "hidden": true,
+            "super-users-only": true
+        },
+        {
+            "key": "servicenow-oauth-client-id",
+            "name": "ServiceNow OAuth Client ID",
+            "type": "text",
+            "required": false,
+            "hidden": true,
+            "super-users-only": true
+        },
+        {
+            "key": "servicenow-oauth-client-secret",
+            "name": "ServiceNow OAuth Client Secret",
+            "type": "password",
+            "required": false,
+            "hidden": true,
+            "super-users-only": true
+        },
+        {
+            "key": "servicenow-oauth-token",
+            "name": "ServiceNow OAuth Token Cache (encrypted)",
+            "type": "text",
+            "required": false,
+            "hidden": true,
+            "super-users-only": true
         },
         {
             "key": "catalog-items",

@@ -2,7 +2,7 @@
 /**
  * ServiceNow Catalog Integration – Configuration Page
  *
- * @var \ExternalModules\AbstractExternalModule $module
+ * @var \YaleREDCap\REDCapServiceNowCatalogIntegration\REDCapServiceNowCatalogIntegration $module
  */
 
 defined('APP_PATH_WEBROOT') || die('Direct access not permitted.');
@@ -17,9 +17,28 @@ $recordHomeUrl = APP_PATH_WEBROOT . 'DataEntry/record_home.php?pid=' . $pid;
 
 
 // ─── Page Data ─────────────────────────────────────────────────────────────────
-$savedUrl      = (string) ($module->getProjectSetting('servicenow-instance-url') ?? '');
-$savedUsername = (string) ($module->getProjectSetting('servicenow-username') ?? '');
-$hasPassword   = !empty($module->getProjectSetting('servicenow-password'));
+// Saved connection settings. The password and client secret are never sent to
+// the page, only whether one is saved.
+$connection            = $module->getConnectionSummary();
+$savedUrl              = $connection['instanceUrl'];
+$savedUsername         = $connection['username'];
+$hasPassword           = $connection['hasPassword'];
+$savedAuthType         = $connection['authType'];
+$savedGrantType        = $connection['grantType'];
+$savedClientId         = $connection['clientId'];
+$hasClientSecret       = $connection['hasClientSecret'];
+$usesUserCredentials   = $savedAuthType === 'basic' || $savedGrantType === 'password';
+$hasConnectionSettings = $connection['hasAnySettings'];
+$connectionSaved       = $connection['isComplete'];
+$savedBaseUrl          = $connection['instanceBaseUrl'];
+// Same shape as currentConnection() in the page's JavaScript.
+$savedConnection = [
+    'instanceUrl' => $savedUrl,
+    'authType'    => $savedAuthType,
+    'grantType'   => $savedAuthType === 'oauth' ? $savedGrantType : '',
+    'clientId'    => $savedAuthType === 'oauth' ? $savedClientId : '',
+    'username'    => $usesUserCredentials ? $savedUsername : '',
+];
 
 $catalogItems = $module->getCatalogItems();
 
@@ -278,36 +297,106 @@ foreach ($redcapForms as $form) {
 
             <div class="form-group">
                 <label for="instance-url" class="font-weight-bold">ServiceNow Instance URL</label>
-                <input type="url" class="form-control" id="instance-url"
+                <?php // autocomplete="off" (here and on the inputs below): the browser must not restore unsaved values when the page is revisited. ?>
+                <input type="url" class="form-control sn-connection-input" id="instance-url"
                        style="max-width:540px"
                        placeholder="https://your-instance.service-now.com"
+                       autocomplete="off" spellcheck="false"
+                       aria-describedby="instance-url-help"
                        value="<?= htmlspecialchars($savedUrl, ENT_QUOTES) ?>">
-                <small class="form-text text-muted">Must begin with <code>https://</code>.</small>
+                <small class="form-text text-muted" id="instance-url-help">Must begin with <code>https://</code>.</small>
             </div>
 
-            <div class="row">
+            <div class="form-group">
+                <span class="font-weight-bold d-block mb-1" id="sn-auth-type-label">Authentication Method</span>
+                <div role="radiogroup" aria-labelledby="sn-auth-type-label" aria-describedby="sn-auth-type-help">
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input sn-connection-input" type="radio" name="sn-auth-type"
+                               id="sn-auth-type-basic" value="basic" autocomplete="off"<?= $savedAuthType === 'basic' ? ' checked' : '' ?>>
+                        <label class="form-check-label" for="sn-auth-type-basic">Basic authentication</label>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input sn-connection-input" type="radio" name="sn-auth-type"
+                               id="sn-auth-type-oauth" value="oauth" autocomplete="off"<?= $savedAuthType === 'oauth' ? ' checked' : '' ?>>
+                        <label class="form-check-label" for="sn-auth-type-oauth">OAuth 2.0</label>
+                    </div>
+                </div>
+                <small class="form-text text-muted" id="sn-auth-type-help">
+                    Basic authentication sends the service account's username and password with every request.
+                    OAuth 2.0 exchanges credentials for short-lived access tokens, which the module reuses and renews automatically.
+                    Only the credentials used by the selected method are kept when you save.
+                </small>
+            </div>
+
+            <div id="sn-oauth-settings"<?= $savedAuthType === 'oauth' ? '' : ' style="display:none"' ?>>
+                <div class="form-group">
+                    <label for="sn-oauth-grant-type" class="font-weight-bold">Grant Type</label>
+                    <select class="form-select sn-connection-input" id="sn-oauth-grant-type" style="max-width:540px"
+                            autocomplete="off" aria-describedby="sn-grant-help-<?= $savedGrantType ?>">
+                        <option value="client_credentials"<?= $savedGrantType === 'client_credentials' ? ' selected' : '' ?>>Client credentials grant (recommended)</option>
+                        <option value="password"<?= $savedGrantType === 'password' ? ' selected' : '' ?>>Password grant</option>
+                    </select>
+                    <small class="form-text text-muted sn-grant-help" data-grant="client_credentials" id="sn-grant-help-client_credentials"
+                           <?= $savedGrantType === 'client_credentials' ? '' : 'style="display:none"' ?>>
+                        Uses only the OAuth client ID and secret, so no username or password is stored. Tokens act as the
+                        <em>OAuth Application User</em> set on the OAuth application in ServiceNow. The client credentials
+                        grant must be enabled on the instance. See the module documentation for the ServiceNow setup steps.
+                    </small>
+                    <small class="form-text text-muted sn-grant-help" data-grant="password" id="sn-grant-help-password"
+                           <?= $savedGrantType === 'password' ? '' : 'style="display:none"' ?>>
+                        Uses the OAuth client ID and secret plus the service account's username and password; tokens are
+                        issued to that service account. ServiceNow discourages this grant for new integrations, and some
+                        instances turn it off. See the module documentation for the ServiceNow setup steps.
+                    </small>
+                </div>
+                <div class="row">
+                    <div class="col-md-4 form-group">
+                        <label for="sn-client-id" class="font-weight-bold">Client ID</label>
+                        <input type="text" class="form-control sn-connection-input" id="sn-client-id"
+                               autocomplete="off" spellcheck="false"
+                               value="<?= htmlspecialchars($savedClientId, ENT_QUOTES) ?>">
+                    </div>
+                    <div class="col-md-4 form-group">
+                        <label for="sn-client-secret" class="font-weight-bold">Client Secret</label>
+                        <div class="input-group">
+                            <input type="password" class="form-control sn-connection-input" id="sn-client-secret"
+                                   autocomplete="new-password" spellcheck="false"
+                                   <?= $hasClientSecret ? 'aria-describedby="sn-client-secret-saved-note"' : '' ?>
+                                   placeholder="<?= $hasClientSecret ? 'Saved — enter to change' : 'Enter client secret' ?>">
+                            <button class="btn btn-outline-secondary" type="button" id="btn-toggle-client-secret"
+                                    title="Show / hide client secret" aria-pressed="false">
+                                <i class="fas fa-eye" id="client-secret-eye-icon"></i>
+                            </button>
+                        </div>
+                        <small class="form-text text-muted" id="sn-client-secret-saved-note"
+                               <?= $hasClientSecret ? '' : 'style="display:none"' ?>>A client secret is saved. Leave blank to keep it.</small>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row" id="sn-user-credentials"<?= $usesUserCredentials ? '' : ' style="display:none"' ?>>
                 <div class="col-md-4 form-group">
                     <label for="sn-username" class="font-weight-bold">Username</label>
-                    <input type="text" class="form-control" id="sn-username"
-                           autocomplete="username"
+                    <?php // Not "username"/"current-password": the browser must not fill in the administrator's own REDCap login. ?>
+                    <input type="text" class="form-control sn-connection-input" id="sn-username"
+                           autocomplete="off" spellcheck="false"
                            placeholder="service_account_name"
                            value="<?= htmlspecialchars($savedUsername, ENT_QUOTES) ?>">
                 </div>
                 <div class="col-md-4 form-group">
                     <label for="sn-password" class="font-weight-bold">Password</label>
                     <div class="input-group">
-                        <input type="password" class="form-control" id="sn-password"
-                               autocomplete="current-password"
-                               placeholder="<?= $hasPassword ? 'Saved — enter to change' : 'Enter password' ?>"
-                               data-has-saved="<?= $hasPassword ? '1' : '0' ?>">
+                        <input type="password" class="form-control sn-connection-input" id="sn-password"
+                               autocomplete="new-password"
+                               <?= $hasPassword ? 'aria-describedby="sn-password-saved-note"' : '' ?>
+                               placeholder="<?= $hasPassword ? 'Saved — enter to change' : 'Enter password' ?>">
                         <button class="btn btn-outline-secondary" type="button" id="btn-toggle-pw"
-                                title="Show / hide password">
+                                title="Show / hide password" aria-pressed="false">
                             <i class="fas fa-eye" id="pw-eye-icon"></i>
                         </button>
                     </div>
-                    <?php if ($hasPassword): ?>
-                    <small class="form-text text-muted">A password is saved. Leave blank to keep it.</small>
-                    <?php endif; ?>
+                    <small class="form-text text-muted" id="sn-password-saved-note"
+                           <?= $hasPassword ? '' : 'style="display:none"' ?>>A password is saved. Leave blank to keep it.</small>
                 </div>
             </div>
 
@@ -319,10 +408,10 @@ foreach ($redcapForms as $form) {
                     <i class="fas fa-save mr-1"></i> Save Connection Settings
                 </button>
                 <button class="btn btn-outline-danger" id="btn-delete-connection" type="button"
-                        style="<?= ($savedUrl === '' && !$hasPassword) ? 'display:none' : '' ?>">
+                        style="<?= $hasConnectionSettings ? '' : 'display:none' ?>">
                     <i class="fas fa-trash mr-1"></i> Delete Connection Settings
                 </button>
-                <span id="test-status"></span>
+                <span id="test-status" role="status"></span>
             </div>
 
         </div>
@@ -679,7 +768,9 @@ foreach ($redcapForms as $form) {
             </div>
             <div class="modal-body">
                 <p>Are you sure you want to delete the saved ServiceNow connection settings
-                   (instance URL, username, and password)?</p>
+                   (instance URL, authentication method, and all saved credentials)?
+                   Any cached OAuth token is also removed from REDCap, but it is not revoked in
+                   ServiceNow; it stays valid there until it expires.</p>
                 <p class="text-danger mb-0"><small><i class="fas fa-exclamation-triangle mr-1"></i>This action cannot be undone.</small></p>
             </div>
             <div class="modal-footer">
@@ -745,7 +836,19 @@ $(document).ready(function () {
     const RC_FIELDS   = <?= json_encode($redcapFields) ?>;
     const RC_FORMS_JSON    = <?= json_encode($redcapForms) ?>;
     const RC_FORMS = new Map(RC_FORMS_JSON.map(f => [f.name, f.label]));
-    let HAS_PASSWORD  = <?= $hasPassword ? 'true' : 'false' ?>;
+    let HAS_PASSWORD      = <?= $hasPassword ? 'true' : 'false' ?>;
+    let HAS_CLIENT_SECRET = <?= $hasClientSecret ? 'true' : 'false' ?>;
+    // The instance the saved password and client secret belong to, as the
+    // server normalizes it (null when none is saved).
+    let SAVED_INSTANCE_BASE = <?= json_encode($savedBaseUrl) ?>;
+    // The saved connection settings other than secrets, in the shape returned
+    // by currentConnection(), to tell whether the page has unsaved changes.
+    let SAVED_CONNECTION = <?= json_encode($savedConnection) ?>;
+    // Whether complete connection settings are saved (fields are always
+    // loaded with the saved settings, not the ones on the page).
+    let CONNECTION_SAVED  = <?= $connectionSaved ? 'true' : 'false' ?>;
+    // Sent in place of a secret left blank, meaning "keep the saved value".
+    const SAVED_SECRET    = '__SAVED__';
     const RECORD_HOME_URL = <?= json_encode($recordHomeUrl) ?>;
     const RECORD_ID_FIELD = <?= json_encode($recordIdField) ?>;
 
@@ -854,13 +957,141 @@ $(document).ready(function () {
         $toast[0].addEventListener('hidden.bs.toast', function () { $(this).remove(); });
     }
 
+    // ── Connection settings helpers ───────────────────────────────────────
+    function getAuthType() {
+        return $('input[name="sn-auth-type"]:checked').val() === 'oauth' ? 'oauth' : 'basic';
+    }
+
+    function getGrantType() {
+        return $('#sn-oauth-grant-type').val() === 'password' ? 'password' : 'client_credentials';
+    }
+
+    // Basic authentication and the OAuth password grant use the service
+    // account username/password; the client credentials grant does not.
+    function usesUserCredentials(authType, grantType) {
+        return authType !== 'oauth' || grantType === 'password';
+    }
+
+    // Shows only the inputs used by the selected authentication method.
+    function updateAuthFields() {
+        const authType  = getAuthType();
+        const grantType = getGrantType();
+        $('#sn-oauth-settings').toggle(authType === 'oauth');
+        $('#sn-user-credentials').toggle(usesUserCredentials(authType, grantType));
+        $('.sn-grant-help').each(function () {
+            $(this).toggle($(this).data('grant') === grantType);
+        });
+        $('#sn-oauth-grant-type').attr('aria-describedby', 'sn-grant-help-' + grantType);
+    }
+
+    // Host names accepted by the server (ServiceNowApiClient::normalizeInstanceUrl()).
+    const INSTANCE_HOST_PATTERN = /^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$/;
+
+    // Returns the base URL the server sends requests for an instance URL to
+    // (https://host, plus the port when it is not 443), or null when the
+    // server would reject the URL. Uses exactly the rules of the server's
+    // ServiceNowApiClient::normalizeInstanceUrl() (for the trimmed value the
+    // page sends), rather than the browser's URL parser, which accepts and
+    // rewrites more.
+    function normalizeInstanceUrl(value) {
+        const url   = String(value || '').trim().replace(/\/+$/, '');
+        const match = /^https:\/\/([^\/?#]*)/i.exec(url);
+        // Whitespace as PHP's \s defines it, so both sides agree.
+        const authority = (match && !/[\t\n\v\f\r ]/.test(match[1])) ? /^([^:@]*)(?::([^:@]*))?$/.exec(match[1]) : null;
+        if (!authority || !INSTANCE_HOST_PATTERN.test(authority[1])) {
+            return null;
+        }
+        let port = 443;
+        if (authority[2] !== undefined && authority[2] !== '') {
+            port = /^[0-9]{1,5}$/.test(authority[2]) ? parseInt(authority[2], 10) : 0;
+            if (port < 1 || port > 65535) {
+                return null;
+            }
+        }
+        return 'https://' + authority[1].toLowerCase() + (port !== 443 ? ':' + port : '');
+    }
+
+    // A saved password or client secret is only ever sent to the saved
+    // instance, so it can only be reused while the Instance URL points there.
+    function isSavedInstance() {
+        return SAVED_INSTANCE_BASE !== null && SAVED_INSTANCE_BASE === normalizeInstanceUrl($('#instance-url').val());
+    }
+
+    // Reflects in a secret input's placeholder and note whether the saved
+    // secret will be used when the input is left blank.
+    function updateSecretField($input, $note, hasSaved, label) {
+        const sameInstance = isSavedInstance();
+        $input.attr('placeholder', hasSaved && sameInstance ? 'Saved — enter to change' : 'Enter ' + label);
+        if (hasSaved) {
+            $note.text(sameInstance
+                ? 'A ' + label + ' is saved. Leave blank to keep it.'
+                : 'The saved ' + label + ' is only used with the saved instance URL. Enter it again to connect to a different instance.');
+            $input.attr('aria-describedby', $note.attr('id'));
+        } else {
+            $input.removeAttr('aria-describedby');
+        }
+        $note.toggle(hasSaved);
+    }
+
+    function updateSavedSecretFields() {
+        updateSecretField($('#sn-password'), $('#sn-password-saved-note'), HAS_PASSWORD, 'password');
+        updateSecretField($('#sn-client-secret'), $('#sn-client-secret-saved-note'), HAS_CLIENT_SECRET, 'client secret');
+    }
+
     function getCredentials() {
-        const pw = $('#sn-password').val();
+        const authType  = getAuthType();
+        const grantType = authType === 'oauth' ? getGrantType() : '';
+        const userCreds = usesUserCredentials(authType, grantType);
+        const pw        = $('#sn-password').val();
+        const secret    = $('#sn-client-secret').val();
+        const reuse     = isSavedInstance();
         return {
-            instanceUrl: $('#instance-url').val().trim(),
-            username:    $('#sn-username').val().trim(),
-            password:    pw !== '' ? pw : (HAS_PASSWORD ? '__SAVED__' : '')
+            instanceUrl:  $('#instance-url').val().trim(),
+            authType:     authType,
+            grantType:    grantType,
+            clientId:     authType === 'oauth' ? $('#sn-client-id').val().trim() : '',
+            clientSecret: authType === 'oauth' ? (secret !== '' ? secret : (HAS_CLIENT_SECRET && reuse ? SAVED_SECRET : '')) : '',
+            username:     userCreds ? $('#sn-username').val().trim() : '',
+            password:     userCreds ? (pw !== '' ? pw : (HAS_PASSWORD && reuse ? SAVED_SECRET : '')) : ''
         };
+    }
+
+    // The connection settings on the page other than secrets, in the shape of
+    // SAVED_CONNECTION.
+    function currentConnection() {
+        const creds = getCredentials();
+        return {
+            instanceUrl: creds.instanceUrl,
+            authType:    creds.authType,
+            grantType:   creds.grantType,
+            clientId:    creds.clientId,
+            username:    creds.username
+        };
+    }
+
+    // Whether the page shows connection settings other than the saved ones,
+    // including a typed password or client secret that the selected method uses.
+    function hasUnsavedConnectionChanges() {
+        const now         = currentConnection();
+        const typedSecret = (usesUserCredentials(now.authType, now.grantType) && $('#sn-password').val() !== '')
+            || (now.authType === 'oauth' && $('#sn-client-secret').val() !== '');
+        return typedSecret
+            || Object.keys(SAVED_CONNECTION).some(function (key) { return now[key] !== SAVED_CONNECTION[key]; });
+    }
+
+    // Labels of the required connection settings that are still empty.
+    function getMissingConnectionFields(creds) {
+        const missing = [];
+        if (!creds.instanceUrl) { missing.push('Instance URL'); }
+        if (creds.authType === 'oauth') {
+            if (!creds.clientId)     { missing.push('Client ID'); }
+            if (!creds.clientSecret) { missing.push('Client Secret'); }
+        }
+        if (usesUserCredentials(creds.authType, creds.grantType)) {
+            if (!creds.username) { missing.push('Username'); }
+            if (!creds.password) { missing.push('Password'); }
+        }
+        return missing;
     }
 
     // ── REDCap field dropdown builders ────────────────────────────────────
@@ -1486,16 +1717,19 @@ $(document).ready(function () {
 
     // ── Load Fields ───────────────────────────────────────────────────────
     function fetchModalFields() {
-        const creds = getCredentials();
         const sysId = $('#modal-item-sys-id').val().trim();
 
-        if (!creds.instanceUrl || !creds.username || !creds.password) {
-            showAlert('warning', 'Please fill in all Connection Settings before loading fields.');
+        // Fields are always loaded with the saved connection settings.
+        if (!CONNECTION_SAVED) {
+            showAlert('warning', 'Save the connection settings before loading fields.');
             return;
         }
         if (!sysId) {
             showAlert('warning', 'Please enter the catalog item sys_id.');
             return;
+        }
+        if (hasUnsavedConnectionChanges()) {
+            showAlert('info', 'Fields are loaded with the saved connection settings. Unsaved changes to the connection settings are not used.', true);
         }
 
         const $btn = $('#btn-modal-fetch').prop('disabled', true)
@@ -1503,11 +1737,9 @@ $(document).ready(function () {
         $('#modal-mapping-table-section').hide();
         $('#modal-mapping-count').hide();
 
+        // No credentials are sent from the page.
         module.ajax('getServiceNowFields', {
-            instanceUrl: creds.instanceUrl,
-            username:    creds.username,
-            password:    creds.password,
-            sysId:       sysId
+            sysId: sysId
         }).then(function (resp) {
             const fields = resp && resp.data;
             if (resp.success && Array.isArray(fields)) {
@@ -1849,59 +2081,136 @@ $(document).ready(function () {
     });
 
     // ── Connection Settings ───────────────────────────────────────────────
+    // Incremented whenever a connection input changes, so a test result
+    // only enables Save for the exact settings that were tested.
+    let connectionVersion = 0;
+    // Whether the settings on the page have passed a test (and are unchanged since).
+    let saveAllowed = false;
+    // Whether a Test, Save, or Delete request is in flight. Only one runs at a
+    // time, so their responses cannot overtake each other.
+    let connectionBusy = false;
+
+    function refreshConnectionButtons() {
+        $('#btn-test, #btn-delete-connection, #btn-confirm-delete-connection').prop('disabled', connectionBusy);
+        $('#btn-save-connection').prop('disabled', connectionBusy || !saveAllowed);
+    }
+
+    function setConnectionBusy(busy) {
+        connectionBusy = busy;
+        refreshConnectionButtons();
+    }
+
+    $('.sn-connection-input').on('input change', function () {
+        connectionVersion++;
+        saveAllowed = false;
+        refreshConnectionButtons();
+        $('#test-status').html('');
+    });
+
+    $('input[name="sn-auth-type"], #sn-oauth-grant-type').on('change', updateAuthFields);
+    $('#instance-url').on('input change', updateSavedSecretFields);
+
+    // When the page is shown again from the browser history, the browser may
+    // have restored inputs to unsaved values without firing change events, so
+    // bring the visible fields in line with the inputs. Restoration happens
+    // before this ready handler runs on a normal history navigation (so sync
+    // now) and before 'pageshow' otherwise.
+    updateAuthFields();
+    updateSavedSecretFields();
+    $(window).on('pageshow', function () {
+        updateAuthFields();
+        updateSavedSecretFields();
+    });
+
     $('#btn-test').on('click', function () {
-        const creds = getCredentials();
-        if (!creds.instanceUrl || !creds.username || !creds.password) {
-            showAlert('warning', 'Please fill in the Instance URL, username, and password before testing.');
+        if (connectionBusy) {
             return;
         }
-        const $btn = $(this).prop('disabled', true)
-                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Testing…');
+        const creds   = getCredentials();
+        const missing = getMissingConnectionFields(creds);
+        if (missing.length > 0) {
+            showAlert('warning', 'Please fill in the following before testing: ' + escHtml(missing.join(', ')) + '.');
+            return;
+        }
+        const testedVersion = connectionVersion;
+        const $btn = $(this).html('<i class="fas fa-spinner fa-spin mr-1"></i> Testing…');
+        setConnectionBusy(true);
         $('#test-status').html('');
 
-        module.ajax('testConnection', {
-            instanceUrl: creds.instanceUrl,
-            username:    creds.username,
-            password:    creds.password
-        }).then(function (resp) {
+        module.ajax('testConnection', creds).then(function (resp) {
+            if (testedVersion !== connectionVersion) {
+                return; // The settings were edited while the test was running.
+            }
             if (resp.success) {
-                $('#test-status').html(
-                    '<span class="text-success"><i class="fas fa-check-circle mr-1"></i>Connected successfully</span>'
+                $('#test-status').html(resp.warning
+                    ? '<span class="text-warning-emphasis"><i class="fas fa-exclamation-triangle mr-1"></i>' + escHtml(resp.warning) + '</span>'
+                    : '<span class="text-success"><i class="fas fa-check-circle mr-1"></i>Connected successfully</span>'
                 );
-                $('#btn-save-connection').prop('disabled', false);
+                saveAllowed = true;
             } else {
                 $('#test-status').html(
                     '<span class="text-danger"><i class="fas fa-times-circle mr-1"></i>' +
                     escHtml((resp && resp.error) || 'Connection failed') + '</span>'
                 );
-                $('#btn-save-connection').prop('disabled', true);
+                saveAllowed = false;
             }
         }).catch(function () {
+            if (testedVersion !== connectionVersion) {
+                return;
+            }
             $('#test-status').html(
                 '<span class="text-danger"><i class="fas fa-times-circle mr-1"></i>Request error</span>'
             );
-            $('#btn-save-connection').prop('disabled', true);
+            saveAllowed = false;
         }).finally(function () {
-            $btn.prop('disabled', false).html('<i class="fas fa-satellite-dish mr-1"></i> Test Connection');
+            $btn.html('<i class="fas fa-satellite-dish mr-1"></i> Test Connection');
+            setConnectionBusy(false);
         });
     });
 
     $('#btn-save-connection').on('click', function () {
-        const creds = getCredentials();
-        const $btn  = $(this).prop('disabled', true)
-                             .html('<i class="fas fa-spinner fa-spin mr-1"></i> Saving…');
+        if (connectionBusy || !saveAllowed) {
+            return;
+        }
+        const creds        = getCredentials();
+        const savedVersion = connectionVersion;
+        const $btn         = $(this).html('<i class="fas fa-spinner fa-spin mr-1"></i> Saving…');
+        setConnectionBusy(true);
 
-        module.ajax('saveConnectionSettings', {
-            instanceUrl: creds.instanceUrl,
-            username:    creds.username,
-            password:    creds.password
-        }).then(function (resp) {
+        module.ajax('saveConnectionSettings', creds).then(function (resp) {
             if (resp.success) {
                 showAlert('success', 'Connection settings saved.', true);
-                if ($('#sn-password').val() !== '') {
-                    HAS_PASSWORD = true;
-                    $('#sn-password').val('').attr('placeholder', 'Saved — enter to change');
+                // The server keeps only the credentials the selected method
+                // uses, and saves the instance URL in its normalized form.
+                const oauth       = creds.authType === 'oauth';
+                const userCreds   = usesUserCredentials(creds.authType, creds.grantType);
+                const instanceUrl = (resp && resp.instanceUrl) || creds.instanceUrl;
+                HAS_PASSWORD        = userCreds;
+                HAS_CLIENT_SECRET   = oauth;
+                SAVED_INSTANCE_BASE = normalizeInstanceUrl(instanceUrl);
+                SAVED_CONNECTION    = {
+                    instanceUrl: instanceUrl,
+                    authType:    creds.authType,
+                    grantType:   creds.grantType,
+                    clientId:    creds.clientId,
+                    username:    creds.username
+                };
+                CONNECTION_SAVED = true;
+                // Show what was saved, unless the inputs were edited while
+                // the settings were being saved.
+                if (savedVersion === connectionVersion) {
+                    $('#instance-url').val(instanceUrl);
+                    $('#sn-password, #sn-client-secret').val('');
+                    if (!userCreds) {
+                        $('#sn-username').val('');
+                    }
+                    if (!oauth) {
+                        $('#sn-client-id').val('');
+                        $('#sn-oauth-grant-type').val('client_credentials');
+                        updateAuthFields();
+                    }
                 }
+                updateSavedSecretFields();
                 $('#btn-delete-connection').show();
             } else {
                 showAlert('danger', 'Save failed: ' + escHtml((resp && resp.error) || 'Unknown error.'));
@@ -1909,27 +2218,45 @@ $(document).ready(function () {
         }).catch(function () {
             showAlert('danger', 'Save request failed. Please try again.');
         }).finally(function () {
-            $btn.prop('disabled', false).html('<i class="fas fa-save mr-1"></i> Save Connection Settings');
+            // Settings edited during the save must be tested before they can be saved.
+            saveAllowed = savedVersion === connectionVersion;
+            $btn.html('<i class="fas fa-save mr-1"></i> Save Connection Settings');
+            setConnectionBusy(false);
         });
     });
 
     // ── Delete Connection Settings ────────────────────────────────────────
     $('#btn-delete-connection').on('click', function () {
-        deleteConnectionConfirmModal.show();
+        if (!connectionBusy) {
+            deleteConnectionConfirmModal.show();
+        }
     });
 
     $('#btn-confirm-delete-connection').on('click', function () {
-        const $btn = $(this).prop('disabled', true)
-                            .html('<i class="fas fa-spinner fa-spin mr-1"></i> Deleting…');
+        if (connectionBusy) {
+            return;
+        }
+        const $btn = $(this).html('<i class="fas fa-spinner fa-spin mr-1"></i> Deleting…');
+        setConnectionBusy(true);
 
         module.ajax('deleteConnectionSettings', {}).then(function (resp) {
             if (resp.success) {
-                HAS_PASSWORD = false;
+                HAS_PASSWORD        = false;
+                HAS_CLIENT_SECRET   = false;
+                SAVED_INSTANCE_BASE = null;
+                SAVED_CONNECTION    = { instanceUrl: '', authType: 'basic', grantType: '', clientId: '', username: '' };
+                CONNECTION_SAVED    = false;
+                connectionVersion++;
+                saveAllowed = false;
                 $('#instance-url').val('');
+                $('#sn-auth-type-basic').prop('checked', true);
+                $('#sn-oauth-grant-type').val('client_credentials');
+                $('#sn-client-id').val('');
                 $('#sn-username').val('');
-                $('#sn-password').val('').attr('placeholder', 'Enter password').data('has-saved', '0');
+                $('#sn-password, #sn-client-secret').val('');
+                updateSavedSecretFields();
+                updateAuthFields();
                 $('#test-status').html('');
-                $('#btn-save-connection').prop('disabled', true);
                 $('#btn-delete-connection').hide();
                 deleteConnectionConfirmModal.hide();
                 showAlert('success', 'Connection settings deleted.', true);
@@ -1939,17 +2266,23 @@ $(document).ready(function () {
         }).catch(function () {
             showAlert('danger', 'Delete request failed. Please try again.');
         }).finally(function () {
-            $btn.prop('disabled', false).html('<i class="fas fa-trash mr-1"></i> Delete');
+            $btn.html('<i class="fas fa-trash mr-1"></i> Delete');
+            setConnectionBusy(false);
         });
     });
 
-    // ── Password visibility toggle ────────────────────────────────────────
-    $('#btn-toggle-pw').on('click', function () {
-        const $input = $('#sn-password');
-        const show   = $input.attr('type') === 'password';
-        $input.attr('type', show ? 'text' : 'password');
-        $('#pw-eye-icon').toggleClass('fa-eye fa-eye-slash');
-    });
+    // ── Password / client secret visibility toggles ───────────────────────
+    function bindSecretToggle(buttonSelector, inputSelector, iconSelector) {
+        $(buttonSelector).on('click', function () {
+            const $input = $(inputSelector);
+            const show   = $input.attr('type') === 'password';
+            $input.attr('type', show ? 'text' : 'password');
+            $(iconSelector).toggleClass('fa-eye fa-eye-slash');
+            $(this).attr('aria-pressed', show ? 'true' : 'false');
+        });
+    }
+    bindSecretToggle('#btn-toggle-pw', '#sn-password', '#pw-eye-icon');
+    bindSecretToggle('#btn-toggle-client-secret', '#sn-client-secret', '#client-secret-eye-icon');
 
     // ── Submission Log (server-side DataTable) ────────────────────────────
     let submissionLogTable = null;
