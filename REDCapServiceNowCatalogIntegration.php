@@ -5,6 +5,7 @@ namespace YaleREDCap\REDCapServiceNowCatalogIntegration;
 use ExternalModules\AbstractExternalModule;
 use ExternalModules\Framework;
 
+require_once __DIR__ . '/classes/ServiceNowCredentials.php';
 require_once __DIR__ . '/classes/ServiceNowApiClient.php';
 
 /**
@@ -324,8 +325,44 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     /** Result field roles that can be mapped to REDCap fields, in display order. */
     private const RESULT_FIELD_KEYS = ['requestNumber', 'ritmNumber', 'status'];
 
+    /**
+     * Sent by the configuration page in place of a password or client secret
+     * that was left blank, meaning "keep the saved value".
+     */
+    private const SAVED_SECRET_PLACEHOLDER = '__SAVED__';
+
+    /** Project setting caching the current OAuth access/refresh token (encrypted JSON). */
+    private const OAUTH_TOKEN_SETTING = 'servicenow-oauth-token';
+
+    /**
+     * Marks a secret setting (password, client secret, or token cache) that
+     * is stored encrypted. Passwords saved by earlier versions of the module
+     * are plain text and have no prefix.
+     */
+    private const ENCRYPTED_SECRET_PREFIX = 'encrypted:v1:';
+
+    /**
+     * Project settings that make up the ServiceNow connection, including the
+     * token cache. All are marked super-users-only in config.json, so only
+     * REDCap administrators can change or export them through the External
+     * Modules framework.
+     */
+    private const CONNECTION_SETTING_KEYS = [
+        'servicenow-instance-url',
+        'servicenow-auth-type',
+        'servicenow-username',
+        'servicenow-password',
+        'servicenow-oauth-grant-type',
+        'servicenow-oauth-client-id',
+        'servicenow-oauth-client-secret',
+        self::OAUTH_TOKEN_SETTING,
+    ];
+
     /** Request item lookups made during this request, keyed by request sys_id. */
     private array $requestItemCache = [];
+
+    /** API clients created during this request, keyed by project ID (see getApiClient()). */
+    private array $apiClients = [];
 
     /**
      * Server-side DataTables endpoint for the RITM submission log.
@@ -414,7 +451,9 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
              . " order by $orderField $orderDir, log_id $orderDir"
              . " limit " . (int) $start . ", " . (int) $length;
 
-        $instanceUrl = rtrim((string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? ''), '/');
+        // Links use the same base URL as requests, so a path in a URL saved by
+        // an earlier version (or anything that is not an https URL) is dropped.
+        $instanceUrl = ServiceNowApiClient::normalizeInstanceUrl($this->getSavedInstanceUrl()) ?? '';
         $statusByMessage = array_flip(self::SUBMISSION_LOG_STATUSES);
 
         $data   = [];
@@ -677,54 +716,329 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
         return ['success' => true];
     }
 
-    private function saveConnectionSettings(array $payload)
+    /**
+     * Saves the connection settings from the configuration page.
+     *
+     * Only the credentials used by the selected authentication method are
+     * kept; any others (e.g. a password after switching to the OAuth client
+     * credentials grant) are removed. The instance URL is saved in its
+     * normalized form (see ServiceNowApiClient::normalizeInstanceUrl()), and
+     * the password and client secret are stored encrypted, bound to that
+     * instance. Any cached OAuth token is discarded so the next request
+     * authenticates with the new settings.
+     */
+    private function saveConnectionSettings(array $payload): array
     {
-        $instanceUrl = trim($payload['instanceUrl'] ?? '');
-        $username    = trim($payload['username']    ?? '');
-        $password    =      $payload['password']    ?? '';
-
-        // The UI sends this sentinel when the password field was left blank,
-        // meaning the previously saved password should be kept as-is.
-        if ($password === '__SAVED__') {
-            $password = (string) ($this->framework->getProjectSetting('servicenow-password') ?? '');
+        $connection = $this->resolveConnectionPayload($payload);
+        if (isset($connection['error'])) {
+            return ['success' => false, 'error' => $connection['error']];
         }
 
-        if ($instanceUrl === '' || $username === '' || $password === '') {
-            return ['success' => false, 'message' => 'Missing required parameters.'];
+        /** @var ServiceNowCredentials $credentials */
+        $credentials = $connection['credentials'];
+        $instanceUrl = $connection['instanceUrl'];
+        $oauth       = $credentials->isOAuth();
+        $userCreds   = $credentials->usesUserCredentials();
+
+        // Encrypt the secrets before changing anything, so a failure leaves
+        // the saved settings as they were.
+        try {
+            $password     = $userCreds ? $this->encryptSecret($credentials->getPassword(), $instanceUrl) : null;
+            $clientSecret = $oauth ? $this->encryptSecret($credentials->getClientSecret(), $instanceUrl) : null;
+        } catch (\RuntimeException $e) {
+            return ['success' => false, 'error' => 'The connection settings could not be saved because the credentials could not be encrypted.'];
         }
-        $this->framework->setProjectSetting('servicenow-instance-url', $instanceUrl);
-        $this->framework->setProjectSetting('servicenow-username',      $username);
-        $this->framework->setProjectSetting('servicenow-password',      $password);
-        return ['success' => true, 'message' => 'Connection settings saved successfully.'];
+
+        // The instance URL is written last: a request that reads the settings
+        // while they are being saved and already sees the new URL then sees
+        // all the other new values too (secrets bound to an instance cover
+        // the other cases, see getSecretSetting()).
+        $values = [
+            'servicenow-auth-type'           => $credentials->getAuthType(),
+            'servicenow-username'            => $userCreds ? $credentials->getUsername() : null,
+            'servicenow-password'            => $password,
+            'servicenow-oauth-grant-type'    => $oauth ? $credentials->getGrantType() : null,
+            'servicenow-oauth-client-id'     => $oauth ? $credentials->getClientId() : null,
+            'servicenow-oauth-client-secret' => $clientSecret,
+            self::OAUTH_TOKEN_SETTING        => null,
+            'servicenow-instance-url'        => $instanceUrl,
+        ];
+        foreach ($values as $key => $value) {
+            if ($value === null) {
+                $this->framework->removeProjectSetting($key);
+            } else {
+                $this->framework->setProjectSetting($key, $value);
+            }
+        }
+        $this->apiClients = [];
+
+        return ['success' => true, 'message' => 'Connection settings saved successfully.', 'instanceUrl' => $instanceUrl];
     }
 
     private function deleteConnectionSettings(): array
     {
-        $this->framework->removeProjectSetting('servicenow-instance-url');
-        $this->framework->removeProjectSetting('servicenow-username');
-        $this->framework->removeProjectSetting('servicenow-password');
+        foreach (self::CONNECTION_SETTING_KEYS as $key) {
+            $this->framework->removeProjectSetting($key);
+        }
+        $this->apiClients = [];
         return ['success' => true, 'message' => 'Connection settings deleted.'];
     }
 
+    /**
+     * Tests the connection settings currently entered on the configuration
+     * page (which may not be saved yet). Any OAuth token obtained is kept in
+     * memory only, so testing never replaces the token cached for the saved
+     * settings.
+     */
     private function testConnection(array $payload): array
     {
-        $instanceUrl = trim($payload['instanceUrl'] ?? '');
-        $username    = trim($payload['username']    ?? '');
-        $password    =      $payload['password']    ?? '';
-
-        if ($instanceUrl === '' || $username === '' || $password === '') {
-            return ['success' => false, 'error' => 'Missing required parameters.'];
+        $connection = $this->resolveConnectionPayload($payload);
+        if (isset($connection['error'])) {
+            return ['success' => false, 'error' => $connection['error']];
         }
 
-        if ($password === '__SAVED__') {
-            $password = (string) ($this->framework->getProjectSetting('servicenow-password') ?? '');
+        $result = (new ServiceNowApiClient($connection['instanceUrl'], $connection['credentials']))->testConnection();
+        if (!$result['success']) {
+            $result['error'] = $this->formatFailureReason($result['error'] ?? null, $result['httpCode'] ?? null);
+        }
+        return $result;
+    }
+
+    /**
+     * Validates connection settings sent by the configuration page and builds
+     * the credentials they describe. A password or client secret sent as
+     * SAVED_SECRET_PLACEHOLDER is replaced with the saved value, which is only
+     * allowed for the saved instance, so a saved secret is never sent to a
+     * different one. The returned instance URL is normalized.
+     *
+     * @return array{instanceUrl?: string, credentials?: ServiceNowCredentials, error?: string}
+     */
+    private function resolveConnectionPayload(array $payload): array
+    {
+        $instanceUrl = is_string($payload['instanceUrl'] ?? null) ? trim($payload['instanceUrl']) : '';
+        $authType    = is_string($payload['authType'] ?? null) ? $payload['authType'] : ServiceNowCredentials::AUTH_BASIC;
+        $grantType   = is_string($payload['grantType'] ?? null) ? $payload['grantType'] : '';
+
+        if (!in_array($authType, ServiceNowCredentials::AUTH_TYPES, true)) {
+            return ['error' => 'Unsupported authentication method.'];
+        }
+        if ($authType === ServiceNowCredentials::AUTH_OAUTH && !in_array($grantType, ServiceNowCredentials::GRANT_TYPES, true)) {
+            return ['error' => 'Unsupported OAuth grant type.'];
         }
 
-        return (new ServiceNowApiClient($instanceUrl, $username, $password))->testConnection();
+        $savedUrl = $this->getSavedInstanceUrl();
+        $username = is_string($payload['username'] ?? null) ? trim($payload['username']) : '';
+        $password = $this->resolveSavedSecret($payload['password'] ?? null, 'servicenow-password', $savedUrl);
+
+        $credentials = $authType === ServiceNowCredentials::AUTH_OAUTH
+            ? ServiceNowCredentials::oauth(
+                $grantType,
+                is_string($payload['clientId'] ?? null) ? trim($payload['clientId']) : '',
+                $this->resolveSavedSecret($payload['clientSecret'] ?? null, 'servicenow-oauth-client-secret', $savedUrl),
+                $username,
+                $password
+            )
+            : ServiceNowCredentials::basic($username, $password);
+
+        $missing = $credentials->getMissingFields();
+        if ($instanceUrl === '') {
+            array_unshift($missing, 'Instance URL');
+        }
+        if (!empty($missing)) {
+            return ['error' => 'Missing required connection settings: ' . implode(', ', $missing) . '.'];
+        }
+
+        $normalizedUrl = ServiceNowApiClient::normalizeInstanceUrl($instanceUrl);
+        if ($normalizedUrl === null) {
+            return ['error' => 'Instance URL must be a valid https:// URL.'];
+        }
+
+        $savedSecrets = [];
+        if ($credentials->isOAuth() && ($payload['clientSecret'] ?? null) === self::SAVED_SECRET_PLACEHOLDER) {
+            $savedSecrets[] = 'client secret';
+        }
+        if ($credentials->usesUserCredentials() && ($payload['password'] ?? null) === self::SAVED_SECRET_PLACEHOLDER) {
+            $savedSecrets[] = 'password';
+        }
+        if (!empty($savedSecrets) && $normalizedUrl !== ServiceNowApiClient::normalizeInstanceUrl($savedUrl)) {
+            return [
+                'error' => 'The saved ' . implode(' and ', $savedSecrets) . ' can only be used with the saved instance URL. '
+                    . 'Enter ' . (count($savedSecrets) > 1 ? 'them' : 'it') . ' again to connect to a different instance.',
+            ];
+        }
+
+        return ['instanceUrl' => $normalizedUrl, 'credentials' => $credentials];
+    }
+
+    /**
+     * Returns a password or client secret from the configuration page, or the
+     * value of $settingKey saved for $savedUrl when the page sent
+     * SAVED_SECRET_PLACEHOLDER.
+     *
+     * @param mixed $value
+     */
+    private function resolveSavedSecret($value, string $settingKey, string $savedUrl): string
+    {
+        if ($value === self::SAVED_SECRET_PLACEHOLDER) {
+            return $this->getSecretSetting($settingKey, $savedUrl);
+        }
+        return is_string($value) ? $value : '';
+    }
+
+    /** Returns the saved instance URL ('' when none is saved). */
+    private function getSavedInstanceUrl(): string
+    {
+        return (string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? '');
+    }
+
+    /**
+     * Builds the credentials described by the project's saved connection
+     * settings, for the instance URL the caller read: a password or client
+     * secret saved for a different instance is treated as missing.
+     */
+    private function getSavedCredentials(string $instanceUrl): ServiceNowCredentials
+    {
+        $username = (string) ($this->framework->getProjectSetting('servicenow-username') ?? '');
+        $password = $this->getSecretSetting('servicenow-password', $instanceUrl);
+
+        if ((string) ($this->framework->getProjectSetting('servicenow-auth-type') ?? '') === ServiceNowCredentials::AUTH_OAUTH) {
+            return ServiceNowCredentials::oauth(
+                (string) ($this->framework->getProjectSetting('servicenow-oauth-grant-type') ?? ''),
+                (string) ($this->framework->getProjectSetting('servicenow-oauth-client-id')  ?? ''),
+                $this->getSecretSetting('servicenow-oauth-client-secret', $instanceUrl),
+                $username,
+                $password
+            );
+        }
+
+        return ServiceNowCredentials::basic($username, $password);
+    }
+
+    /** Whether complete connection settings are saved for the project. */
+    private function hasSavedConnection(): bool
+    {
+        $instanceUrl = $this->getSavedInstanceUrl();
+        return $instanceUrl !== '' && $this->getSavedCredentials($instanceUrl)->getValidationError() === null;
+    }
+
+    /**
+     * Describes the saved connection settings for the configuration page,
+     * without revealing the password, client secret, or token.
+     * `instanceBaseUrl` is the normalized instance URL (null when the saved URL
+     * is not valid), which saved secrets are bound to.
+     *
+     * @return array{
+     *   instanceUrl: string, instanceBaseUrl: ?string, authType: string, grantType: string, clientId: string,
+     *   username: string, hasPassword: bool, hasClientSecret: bool, hasAnySettings: bool, isComplete: bool
+     * }
+     */
+    public function getConnectionSummary(): array
+    {
+        $instanceUrl = $this->getSavedInstanceUrl();
+        $credentials = $this->getSavedCredentials($instanceUrl);
+
+        $hasAnySettings = false;
+        foreach (self::CONNECTION_SETTING_KEYS as $key) {
+            $value = $this->framework->getProjectSetting($key);
+            if ($value !== null && $value !== '') {
+                $hasAnySettings = true;
+                break;
+            }
+        }
+
+        return [
+            'instanceUrl'     => $instanceUrl,
+            'instanceBaseUrl' => ServiceNowApiClient::normalizeInstanceUrl($instanceUrl),
+            // Projects configured before OAuth support was added have no
+            // saved method and use basic authentication.
+            'authType'        => $credentials->getAuthType(),
+            // The client credentials grant is the default for new OAuth setups.
+            'grantType'       => $credentials->getGrantType() === ServiceNowCredentials::GRANT_PASSWORD
+                ? ServiceNowCredentials::GRANT_PASSWORD
+                : ServiceNowCredentials::GRANT_CLIENT_CREDENTIALS,
+            'clientId'        => $credentials->getClientId(),
+            'username'        => $credentials->getUsername(),
+            'hasPassword'     => $credentials->getPassword() !== '',
+            'hasClientSecret' => $credentials->getClientSecret() !== '',
+            // Includes a token cache left without other settings, so it can
+            // still be deleted.
+            'hasAnySettings'  => $hasAnySettings,
+            'isComplete'      => $instanceUrl !== '' && $credentials->getValidationError() === null,
+        ];
+    }
+
+    /**
+     * Returns a secret project setting (password, client secret, or token
+     * cache) decrypted, or '' when it is not set, cannot be decrypted, or was
+     * saved for a different instance than $instanceUrl.
+     *
+     * Secrets are stored encrypted with REDCap's key for configuration
+     * secrets, so anyone who can read the project's module settings without
+     * that key (for example through the External Modules framework's settings
+     * requests) gets only ciphertext. Each secret is encrypted together with
+     * the instance it was saved for. The connection settings are separate
+     * settings, so a request that reads them while an administrator is saving
+     * new ones could otherwise pair one instance's URL with the other's
+     * secret; with the binding, it finds no secret instead.
+     *
+     * A password or client secret stored in plain text by an earlier version
+     * of the module still works, and is encrypted (for $instanceUrl, which the
+     * caller read just before) the first time it is read.
+     */
+    private function getSecretSetting(string $key, string $instanceUrl): string
+    {
+        $value    = $this->framework->getProjectSetting($key);
+        $instance = ServiceNowApiClient::normalizeInstanceUrl($instanceUrl);
+        if (!is_string($value) || $value === '' || $instance === null) {
+            return '';
+        }
+
+        if (strpos($value, self::ENCRYPTED_SECRET_PREFIX) !== 0) {
+            if ($key === self::OAUTH_TOKEN_SETTING) {
+                // The token cache is only ever written encrypted.
+                return '';
+            }
+            try {
+                // Skip the write if the settings were saved in the meantime.
+                if ($this->framework->getProjectSetting($key) === $value) {
+                    $this->framework->setProjectSetting($key, $this->encryptSecret($value, $instance));
+                }
+            } catch (\Throwable $e) {
+                // Keep using it; it is encrypted when the settings are next saved.
+            }
+            return $value;
+        }
+
+        $decrypted = \System::decryptConfigSetting(substr($value, strlen(self::ENCRYPTED_SECRET_PREFIX)));
+        $secret    = is_string($decrypted) ? json_decode($decrypted, true) : null;
+        if (!is_array($secret) || ($secret['instance'] ?? null) !== $instance || !is_string($secret['value'] ?? null)) {
+            return '';
+        }
+        return $secret['value'];
+    }
+
+    /**
+     * Encrypts a secret, bound to the instance it belongs to, for storage in a
+     * project setting (see getSecretSetting()).
+     *
+     * @throws \RuntimeException When the value cannot be encrypted.
+     */
+    private function encryptSecret(string $value, string $instanceUrl): string
+    {
+        $instance  = ServiceNowApiClient::normalizeInstanceUrl($instanceUrl);
+        $json      = json_encode(['instance' => $instance, 'value' => $value]);
+        $encrypted = ($instance !== null && is_string($json)) ? \System::encryptConfigSetting($json) : false;
+        if (!is_string($encrypted) || $encrypted === '') {
+            throw new \RuntimeException('The value could not be encrypted.');
+        }
+        return self::ENCRYPTED_SECRET_PREFIX . $encrypted;
     }
 
     private function getServiceNowFields(string $catalogItemId): array
     {
+        if (!$this->hasSavedConnection()) {
+            return ['success' => false, 'error' => 'Save the connection settings before loading fields.'];
+        }
         return $this->getApiClient()->getCatalogItemVariables($catalogItemId);
     }
 
@@ -1309,14 +1623,61 @@ class REDCapServiceNowCatalogIntegration extends AbstractExternalModule
     }
 
     /**
-     * Creates a ServiceNowApiClient using the project's saved connection settings.
+     * Returns a ServiceNowApiClient for the project's saved connection settings.
+     *
+     * One client is used per project for the rest of the request, so all the
+     * catalog items, RITM lookups, and attachment uploads of a record save
+     * share its OAuth token, and a token request that fails is not repeated
+     * for each of them (see ServiceNowApiClient::TOKEN_FAILURE_BACKOFF).
+     * Saving or deleting the connection settings starts over with a new client.
      */
     private function getApiClient(): ServiceNowApiClient
     {
+        $projectId = (string) $this->framework->getProjectId();
+        if (!isset($this->apiClients[$projectId])) {
+            $this->apiClients[$projectId] = $this->createApiClient();
+        }
+        return $this->apiClients[$projectId];
+    }
+
+    /**
+     * Creates a ServiceNowApiClient using the project's saved connection settings.
+     *
+     * With OAuth, the client caches its token (encrypted) in a project setting
+     * so later requests (e.g. the next record save) reuse it until it expires
+     * instead of requesting a new token every time.
+     */
+    private function createApiClient(): ServiceNowApiClient
+    {
+        $instanceUrl = $this->getSavedInstanceUrl();
+        $credentials = $this->getSavedCredentials($instanceUrl);
+        $fingerprint = (new ServiceNowApiClient($instanceUrl, $credentials))->getTokenFingerprint();
+
         return new ServiceNowApiClient(
-            (string) ($this->framework->getProjectSetting('servicenow-instance-url') ?? ''),
-            (string) ($this->framework->getProjectSetting('servicenow-username')     ?? ''),
-            (string) ($this->framework->getProjectSetting('servicenow-password')     ?? '')
+            $instanceUrl,
+            $credentials,
+            function () use ($instanceUrl): ?array {
+                $token = $this->decodeProjectSettingJson($this->getSecretSetting(self::OAUTH_TOKEN_SETTING, $instanceUrl), null);
+                return is_array($token) ? $token : null;
+            },
+            function (?array $token) use ($fingerprint): void {
+                // An administrator may have saved or deleted the connection
+                // settings while this request was running. Only change the
+                // cached token if the saved settings are still the ones this
+                // client uses (and the token was issued for them).
+                $savedUrl = $this->getSavedInstanceUrl();
+                $saved    = new ServiceNowApiClient($savedUrl, $this->getSavedCredentials($savedUrl));
+                if ($fingerprint !== $saved->getTokenFingerprint()
+                    || ($token !== null && ($token['fingerprint'] ?? null) !== $fingerprint)
+                ) {
+                    return;
+                }
+                if ($token === null) {
+                    $this->framework->removeProjectSetting(self::OAUTH_TOKEN_SETTING);
+                } else {
+                    $this->framework->setProjectSetting(self::OAUTH_TOKEN_SETTING, $this->encryptSecret(json_encode($token), $savedUrl));
+                }
+            }
         );
     }
 
